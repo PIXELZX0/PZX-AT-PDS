@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDS Admin</title>
+<style>
+:root { --bg: #fff; --fg: #1a1a1a; --muted: #666; --line: #ddd; --accent: #0a66d8; --bad: #c62828; --chip: #f1f3f5; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #15171a; --fg: #e8e8e8; --muted: #999; --line: #333; --accent: #4c9bff; --bad: #ff6b6b; --chip: #24272b; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; }
+main { max-width: 1000px; margin: 0 auto; padding: 24px 16px; }
+h1 { font-size: 20px; margin: 0 0 16px; display: flex; justify-content: space-between; align-items: center; }
+h2 { font-size: 16px; margin: 32px 0 8px; }
+form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+input { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); min-width: 0; }
+button { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--chip); color: var(--fg); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--bad); }
+button:disabled { opacity: .5; cursor: default; }
+.wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+td.actions { white-space: nowrap; }
+td.actions button { padding: 3px 8px; font-size: 13px; }
+code { font: 12px ui-monospace, monospace; word-break: break-all; }
+.muted { color: var(--muted); }
+.bad { color: var(--bad); }
+#msg { min-height: 1.5em; margin: 8px 0; }
+#msg pre { white-space: pre-wrap; background: var(--chip); padding: 8px; border-radius: 6px; margin: 4px 0; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PDS Admin <button id="logout" hidden>Log out</button></h1>
+  <div id="msg" role="status"></div>
+
+  <section id="login">
+    <form id="login-form">
+      <label for="pw">Admin password</label>
+      <input id="pw" type="password" autocomplete="current-password" required>
+      <button class="primary">Log in</button>
+    </form>
+  </section>
+
+  <section id="panel" hidden>
+    <h2>Invite codes</h2>
+    <form id="invite-form">
+      <label for="uses">Uses</label>
+      <input id="uses" type="number" min="1" max="100000" value="1" style="width:6em">
+      <input id="for" placeholder="for account DID (optional)">
+      <button class="primary">Create invite code</button>
+    </form>
+    <div class="wrap"><table>
+      <thead><tr><th>Code</th><th>Uses left</th><th>For</th><th>Created</th><th></th></tr></thead>
+      <tbody id="invites"></tbody>
+    </table></div>
+
+    <h2>Create account</h2>
+    <form id="account-form">
+      <input id="handle" placeholder="handle" required>
+      <input id="email" type="email" placeholder="email (optional)">
+      <input id="newpw" type="text" placeholder="password (blank: random)">
+      <button class="primary">Create account</button>
+    </form>
+
+    <h2>Accounts</h2>
+    <div class="wrap"><table>
+      <thead><tr><th>Handle</th><th>Email</th><th>DID</th><th>Created</th><th>Status</th><th></th></tr></thead>
+      <tbody id="accounts"></tbody>
+    </table></div>
+  </section>
+</main>
+<script>
+const X = "/xrpc/";
+const $ = id => document.getElementById(id);
+let authz = "";
+try { authz = sessionStorage.getItem("pds-admin") || ""; } catch {}
+
+function el(tag, props = {}, ...kids) {
+  const e = Object.assign(document.createElement(tag), props);
+  e.append(...kids);
+  return e;
+}
+function say(text, isErr, extra) {
+  const m = $("msg");
+  m.replaceChildren(el("span", { className: isErr ? "bad" : "", textContent: text }));
+  if (extra) m.append(el("pre", { textContent: extra }));
+}
+function randomPw() {
+  const b = crypto.getRandomValues(new Uint8Array(18));
+  return btoa(String.fromCharCode(...b)).replace(/[+/=]/g, "").slice(0, 24);
+}
+async function call(nsid, { params, body, admin = true } = {}) {
+  const url = X + nsid + (params ? "?" + new URLSearchParams(params) : "");
+  const headers = {};
+  if (admin) headers.Authorization = authz;
+  if (body) headers["Content-Type"] = "application/json";
+  const r = await fetch(url, { method: body ? "POST" : "GET", headers, body: body && JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    if (r.status === 401 && admin) logout();
+    throw new Error((j.error || r.status) + (j.message ? ": " + j.message : ""));
+  }
+  return j;
+}
+async function act(fn) {
+  try { await fn(); } catch (e) { say(e.message, true); }
+}
+
+function logout() {
+  authz = "";
+  try { sessionStorage.removeItem("pds-admin"); } catch {}
+  $("panel").hidden = $("logout").hidden = true;
+  $("login").hidden = false;
+}
+$("logout").onclick = () => { logout(); say(""); };
+
+$("login-form").onsubmit = e => {
+  e.preventDefault();
+  authz = "Basic " + btoa("admin:" + $("pw").value);
+  $("pw").value = "";
+  act(async () => {
+    await call("com.atproto.admin.getInviteCodes");
+    try { sessionStorage.setItem("pds-admin", authz); } catch {}
+    show();
+  });
+};
+
+async function show() {
+  $("login").hidden = true;
+  $("panel").hidden = $("logout").hidden = false;
+  say("");
+  await Promise.all([loadInvites(), loadAccounts()]);
+}
+
+async function loadInvites() {
+  const { codes } = await call("com.atproto.admin.getInviteCodes");
+  $("invites").replaceChildren(...codes.map(c => {
+    const off = c.available < 1;
+    return el("tr", { className: off ? "muted" : "" },
+      el("td", {}, el("code", { textContent: c.code })),
+      el("td", { textContent: c.available }),
+      el("td", {}, el("code", { textContent: c.forAccount })),
+      el("td", { textContent: c.createdAt.slice(0, 16).replace("T", " ") }),
+      el("td", { className: "actions" },
+        el("button", { textContent: "Copy", onclick: () => navigator.clipboard.writeText(c.code).then(() => say("Copied " + c.code)) }),
+        " ",
+        el("button", { textContent: "Disable", className: "danger", disabled: off, onclick: () => act(async () => {
+          await call("com.atproto.admin.disableInviteCodes", { body: { codes: [c.code] } });
+          say("Disabled " + c.code);
+          await loadInvites();
+        }) })));
+  }));
+}
+
+async function loadAccounts() {
+  const repos = [];
+  let cursor;
+  do {
+    const r = await call("com.atproto.sync.listRepos", { params: cursor ? { limit: 1000, cursor } : { limit: 1000 }, admin: false });
+    repos.push(...r.repos);
+    cursor = r.cursor;
+  } while (cursor);
+  const infos = await Promise.all(repos.map(r =>
+    call("com.atproto.admin.getAccountInfo", { params: { did: r.did } }).catch(() => ({ did: r.did, handle: "?" }))));
+  $("accounts").replaceChildren(...repos.map((r, i) => accountRow(r, infos[i])));
+}
+
+function accountRow(repo, info) {
+  const down = repo.status === "takendown";
+  const btn = (text, fn, cls = "") => el("button", { textContent: text, className: cls, onclick: () => act(fn) });
+  return el("tr", {},
+    el("td", { textContent: info.handle }),
+    el("td", { textContent: info.email || "" }),
+    el("td", {}, el("code", { textContent: repo.did })),
+    el("td", { textContent: (info.indexedAt || "").slice(0, 16).replace("T", " ") }),
+    el("td", { className: down ? "bad" : "", textContent: repo.active ? "active" : repo.status || "inactive" }),
+    el("td", { className: "actions" },
+      btn("Reset password", async () => {
+        const password = randomPw();
+        await call("com.atproto.admin.updateAccountPassword", { body: { did: repo.did, password } });
+        say("New password for " + info.handle + ":", false, password);
+      }),
+      " ",
+      btn(down ? "Untakedown" : "Takedown", async () => {
+        if (!down && !confirm("Take down " + info.handle + "? They can't log in and their repo stops being served.")) return;
+        await call("com.atproto.admin.updateSubjectStatus", { body: {
+          subject: { $type: "com.atproto.admin.defs#repoRef", did: repo.did },
+          takedown: { applied: !down } } });
+        say((down ? "Restored " : "Took down ") + info.handle);
+        await loadAccounts();
+      }, down ? "" : "danger"),
+      " ",
+      btn("Delete", async () => {
+        if (prompt("This permanently deletes " + info.handle + " and all its data. Type the handle to confirm:") !== info.handle) return;
+        await call("com.atproto.admin.deleteAccount", { body: { did: repo.did } });
+        say("Deleted " + info.handle);
+        await loadAccounts();
+      }, "danger")));
+}
+
+$("invite-form").onsubmit = e => {
+  e.preventDefault();
+  act(async () => {
+    const body = { useCount: Number($("uses").value) };
+    if ($("for").value.trim()) body.forAccount = $("for").value.trim();
+    const { code } = await call("com.atproto.server.createInviteCode", { body });
+    say("Invite code:", false, code);
+    $("for").value = "";
+    await loadInvites();
+  });
+};
+
+$("account-form").onsubmit = e => {
+  e.preventDefault();
+  act(async () => {
+    const password = $("newpw").value || randomPw();
+    const { code: inviteCode } = await call("com.atproto.server.createInviteCode", { body: { useCount: 1 } });
+    const body = { handle: $("handle").value.trim(), password, inviteCode };
+    if ($("email").value.trim()) body.email = $("email").value.trim();
+    const r = await call("com.atproto.server.createAccount", { body, admin: false }).catch(async err => {
+      await call("com.atproto.admin.disableInviteCodes", { body: { codes: [inviteCode] } }).catch(() => {});
+      throw err;
+    });
+    say("Account created", false, "Handle   : " + r.handle + "\nDID      : " + r.did + "\nPassword : " + password);
+    $("account-form").reset();
+    await Promise.all([loadInvites(), loadAccounts()]);
+  });
+};
+
+if (authz) act(show);
+</script>
+</body>
+</html>
