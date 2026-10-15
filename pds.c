@@ -2,7 +2,9 @@
  *
  * Accounts, sessions (HS256 JWT) and record CRUD over XRPC, stored in SQLite.
  * Each write rebuilds the repo's Merkle Search Tree and signs a v3 commit with
- * the account's secp256k1 key; com.atproto.sync.getRepo exports it as a CAR.
+ * the account's secp256k1 key; com.atproto.sync.getRepo exports it as a CAR
+ * and subscribeRepos streams commits. DIDs are did:plc, registered with the
+ * PLC directory, and relays are asked to crawl (both off on localhost).
  */
 #include <ctype.h>
 #include <math.h>
@@ -17,6 +19,7 @@
 #include <unistd.h>
 
 #include <cjson/cJSON.h>
+#include <curl/curl.h>
 #include <microhttpd.h>
 #include <openssl/bn.h>
 #include <openssl/core_names.h>
@@ -34,7 +37,7 @@
 #define REFRESH_TTL (60 * 24 * 3600)
 
 static sqlite3 *db;
-static const char *hostname;
+static const char *hostname, *plc_url, *crawler; /* NULL: stay local */
 static char endpoint[300], service_did[300];
 static unsigned char jwt_secret[32];
 
@@ -732,6 +735,80 @@ static void on_upgrade(void *cls, struct MHD_Connection *c, void *req_cls, const
 	subs[nsubs++].urh = urh;
 }
 
+/* ---------- outbound: PLC directory, relays ---------- */
+
+static size_t discard(char *p, size_t size, size_t n, void *u) {
+	(void)p, (void)u;
+	return size * n;
+}
+
+/* ponytail: synchronous, on the server thread (10s timeout). Fine for account
+ * creation and startup; queue it if outbound calls become frequent. */
+static int post_json(const char *url, const char *body) {
+	CURL *c = curl_easy_init();
+	if (!c) return -1;
+	struct curl_slist *h = curl_slist_append(NULL, "Content-Type: application/json");
+	long code = 0;
+	curl_easy_setopt(c, CURLOPT_URL, url);
+	curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+	curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
+	curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, discard);
+	int rc = curl_easy_perform(c) == CURLE_OK ? 0 : -1;
+	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+	if (code / 100 != 2) rc = -1;
+	curl_slist_free_all(h);
+	curl_easy_cleanup(c);
+	if (rc) fprintf(stderr, "POST %s failed (HTTP %ld)\n", url, code);
+	return rc;
+}
+
+/* Signed PLC genesis op as JSON; the DID is derived from its hash.
+ * ponytail: the account key doubles as the PLC rotation key, and handle
+ * changes are never sent to PLC. Add a PDS rotation key + update ops later. */
+static char *plc_genesis(EVP_PKEY *k, const char *pubkey, const char *handle, char did[64]) {
+	char key[80], aka[300], sig64[100], h32[64];
+	unsigned char sig[64], h[32];
+	snprintf(key, sizeof key, "did:key:%s", pubkey);
+	snprintf(aka, sizeof aka, "at://%s", handle);
+	cJSON *op = cJSON_CreateObject(), *vm = cJSON_CreateObject(), *svcs = cJSON_CreateObject(),
+	      *pds = cJSON_CreateObject();
+	cJSON_AddStringToObject(op, "type", "plc_operation");
+	cJSON_AddItemToObject(op, "rotationKeys", cJSON_CreateStringArray((const char *[]){key}, 1));
+	cJSON_AddStringToObject(vm, "atproto", key);
+	cJSON_AddItemToObject(op, "verificationMethods", vm);
+	cJSON_AddItemToObject(op, "alsoKnownAs", cJSON_CreateStringArray((const char *[]){aka}, 1));
+	cJSON_AddStringToObject(pds, "type", "AtprotoPersonalDataServer");
+	cJSON_AddStringToObject(pds, "endpoint", endpoint);
+	cJSON_AddItemToObject(svcs, "atproto_pds", pds);
+	cJSON_AddItemToObject(op, "services", svcs);
+	cJSON_AddNullToObject(op, "prev");
+	buf b = {0};
+	char *json = NULL;
+	if (!cbor(&b, op) && !sign(k, &b, sig)) {
+		b64url(sig, sizeof sig, sig64);
+		cJSON_AddStringToObject(op, "sig", sig64);
+		b.n = 0;
+		cbor(&b, op);
+		SHA256(b.p, b.n, h);
+		b32(h, sizeof h, h32);
+		snprintf(did, 64, "did:plc:%.24s", h32);
+		json = cJSON_PrintUnformatted(op);
+	}
+	free(b.p);
+	cJSON_Delete(op);
+	return json;
+}
+
+/* Asks the relay to start crawling (it then subscribes to our firehose). */
+static void request_crawl(void) {
+	char url[512], body[300];
+	if (!crawler) return;
+	snprintf(url, sizeof url, "%s/xrpc/com.atproto.sync.requestCrawl", crawler);
+	snprintf(body, sizeof body, "{\"hostname\":\"%s\"}", hostname);
+	post_json(url, body);
+}
+
 /* ---------- validation ---------- */
 
 static int valid_nsid(const char *s) {
@@ -860,32 +937,31 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 	if (!find_account(handle, 0, &a)) return err(c, 400, "HandleNotAvailable", "handle already taken");
 	if (email && !find_account(email, 1, &a)) return err(c, 400, "InvalidRequest", "email already taken");
 
-	/* ponytail: local did:plc, not registered with plc.directory, so other
-	 * services can't resolve it. Sign a PLC genesis op with the key to federate. */
-	unsigned char rnd[15], salt[16];
-	RAND_bytes(rnd, sizeof rnd);
+	unsigned char salt[16];
 	RAND_bytes(salt, sizeof salt);
-	strcpy(a.did, "did:plc:");
-	b32(rnd, sizeof rnd, a.did + 8);
 	snprintf(a.handle, sizeof a.handle, "%s", handle);
 	snprintf(a.email, sizeof a.email, "%s", email ? email : "");
 	hex(salt, sizeof salt, a.salt);
 	hash_pw(pw, a.salt, a.hash);
 	char *pem = new_key_pem();
 	EVP_PKEY *k = pem ? load_key(pem) : NULL;
-	int rc = !k || pub_multikey(k, a.pubkey);
+	char *op = k && !pub_multikey(k, a.pubkey) ? plc_genesis(k, a.pubkey, a.handle, a.did) : NULL;
+	char plc[600];
 	EVP_PKEY_free(k);
+	snprintf(plc, sizeof plc, "%s/%s", plc_url ? plc_url : "", a.did);
 	buf blocks = {0};
 	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
-	rc = rc ||
-	     exec1(q("INSERT INTO account(did,handle,email,salt,hash,key,pubkey) VALUES(?,?,?,?,?,?,?)", 7, a.did,
-	             a.handle, email, a.salt, a.hash, pem, a.pubkey)) ||
-	     new_commit(a.did, &blocks, a.head, a.rev) || /* empty repo */
-	     account_events(a.did, a.handle) || commit_event(a.did, NULL, NULL, a.head, a.rev, &blocks, NULL, 0);
+	int rc = !op ||
+	         exec1(q("INSERT INTO account(did,handle,email,salt,hash,key,pubkey,plc_op) VALUES(?,?,?,?,?,?,?,?)", 8,
+	                 a.did, a.handle, email, a.salt, a.hash, pem, a.pubkey, op)) ||
+	         new_commit(a.did, &blocks, a.head, a.rev) || /* empty repo */
+	         account_events(a.did, a.handle) ||
+	         commit_event(a.did, NULL, NULL, a.head, a.rev, &blocks, NULL, 0) || (plc_url && post_json(plc, op));
 	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
-	free(pem), free(blocks.p);
+	free(pem), free(op), free(blocks.p);
 	broadcast();
 	if (rc) return err(c, 500, "InternalServerError", "could not create account");
+	request_crawl();
 	return session(c, &a);
 }
 
@@ -1334,13 +1410,17 @@ int main(void) {
 	if (!strcmp(hostname, "localhost")) snprintf(endpoint, sizeof endpoint, "http://localhost:%d", port);
 	else snprintf(endpoint, sizeof endpoint, "https://%s", hostname);
 	snprintf(service_did, sizeof service_did, "did:web:%s", hostname);
+	int local = !strcmp(hostname, "localhost");
+	plc_url = env("PDS_PLC_URL", local ? NULL : "https://plc.directory");
+	crawler = env("PDS_CRAWLER", local ? NULL : "https://bsky.network");
+	curl_global_init(CURL_GLOBAL_DEFAULT);
 
 	if (sqlite3_open(env("PDS_DB", "pds.sqlite"), &db) ||
 	    sqlite3_exec(db,
 	                 "PRAGMA journal_mode=WAL;"
 	                 "CREATE TABLE IF NOT EXISTS account(did TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL,"
 	                 " email TEXT UNIQUE, salt TEXT NOT NULL, hash TEXT NOT NULL, key TEXT NOT NULL,"
-	                 " pubkey TEXT NOT NULL, head TEXT, rev TEXT, head_block BLOB);"
+	                 " pubkey TEXT NOT NULL, head TEXT, rev TEXT, head_block BLOB, plc_op TEXT);"
 	                 "CREATE TABLE IF NOT EXISTS record(did TEXT NOT NULL, collection TEXT NOT NULL,"
 	                 " rkey TEXT NOT NULL, cid TEXT NOT NULL, value TEXT NOT NULL,"
 	                 " PRIMARY KEY(did, collection, rkey));"
@@ -1365,6 +1445,8 @@ int main(void) {
 		fprintf(stderr, "cannot listen on port %d\n", port);
 		return 1;
 	}
-	fprintf(stderr, "PDS %s listening on :%d\n", hostname, port);
+	fprintf(stderr, "PDS %s listening on :%d (plc: %s, crawler: %s)\n", hostname, port, plc_url ? plc_url : "off",
+	        crawler ? crawler : "off");
+	request_crawl();
 	for (;;) pause();
 }
