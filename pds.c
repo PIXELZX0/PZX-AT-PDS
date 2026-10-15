@@ -640,11 +640,11 @@ static int commit_event(const char *did, const char *since, const unsigned char 
 	return event_end(seq, &f);
 }
 
-/* #identity then #account, announced when an account is created. */
-static int account_events(const char *did, const char *handle) {
+/* #identity then #account (when announcing a new account) or #identity alone. */
+static int account_events(const char *did, const char *handle, int with_account) {
 	char t[32];
 	now_iso(t);
-	for (int i = 0; i < 2; i++) {
+	for (int i = 0; i < 1 + with_account; i++) {
 		buf f = {0};
 		long long seq = event_begin(did, &f, i ? "#account" : "#identity");
 		if (seq < 0) return -1;
@@ -787,10 +787,11 @@ static int post_json(const char *url, const char *body) {
 	return -1;
 }
 
-/* Signed PLC genesis op as JSON; the DID is derived from its hash.
+/* Signed PLC op as JSON. With prev NULL it is the genesis op and the DID is
+ * derived from its hash; otherwise it updates the DID whose last op is prev.
  * ponytail: the account key doubles as the PLC rotation key, and handle
  * changes are never sent to PLC. Add a PDS rotation key + update ops later. */
-static char *plc_genesis(EVP_PKEY *k, const char *pubkey, const char *handle, char did[64]) {
+static char *plc_op(EVP_PKEY *k, const char *pubkey, const char *handle, const char *prev, char did[64]) {
 	char key[80], aka[300], sig64[100], h32[64];
 	unsigned char sig[64], h[32];
 	snprintf(key, sizeof key, "did:key:%s", pubkey);
@@ -806,17 +807,20 @@ static char *plc_genesis(EVP_PKEY *k, const char *pubkey, const char *handle, ch
 	cJSON_AddStringToObject(pds, "endpoint", endpoint);
 	cJSON_AddItemToObject(svcs, "atproto_pds", pds);
 	cJSON_AddItemToObject(op, "services", svcs);
-	cJSON_AddNullToObject(op, "prev");
+	if (prev) cJSON_AddStringToObject(op, "prev", prev);
+	else cJSON_AddNullToObject(op, "prev");
 	buf b = {0};
 	char *json = NULL;
 	if (!cbor(&b, op) && !sign(k, &b, sig)) {
 		b64url(sig, sizeof sig, sig64);
 		cJSON_AddStringToObject(op, "sig", sig64);
-		b.n = 0;
-		cbor(&b, op);
-		SHA256(b.p, b.n, h);
-		b32(h, sizeof h, h32);
-		snprintf(did, 64, "did:plc:%.24s", h32);
+		if (!prev) {
+			b.n = 0;
+			cbor(&b, op);
+			SHA256(b.p, b.n, h);
+			b32(h, sizeof h, h32);
+			snprintf(did, 64, "did:plc:%.24s", h32);
+		}
 		json = cJSON_PrintUnformatted(op);
 	}
 	free(b.p);
@@ -916,6 +920,8 @@ static int auth(struct MHD_Connection *c, const char *scope, char did[64]) {
 	return h && !strncmp(h, "Bearer ", 7) ? verify_jwt(h + 7, scope, did) : -1;
 }
 
+static cJSON *did_doc(const account *a);
+
 static res session(struct MHD_Connection *c, const account *a) {
 	char at[1024], rt[1024];
 	make_jwt(a->did, "com.atproto.access", "at+jwt", ACCESS_TTL, at);
@@ -926,6 +932,7 @@ static res session(struct MHD_Connection *c, const account *a) {
 	cJSON_AddStringToObject(o, "handle", a->handle);
 	cJSON_AddStringToObject(o, "did", a->did);
 	if (*a->email) cJSON_AddStringToObject(o, "email", a->email);
+	cJSON_AddItemToObject(o, "didDoc", did_doc(a));
 	cJSON_AddBoolToObject(o, "active", 1);
 	return reply(c, 200, o);
 }
@@ -1144,7 +1151,7 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 	hash_pw(pw, a.salt, a.hash);
 	char *pem = new_key_pem();
 	EVP_PKEY *k = pem ? load_key(pem) : NULL;
-	char *op = k && !pub_multikey(k, a.pubkey) ? plc_genesis(k, a.pubkey, a.handle, a.did) : NULL;
+	char *op = k && !pub_multikey(k, a.pubkey) ? plc_op(k, a.pubkey, a.handle, NULL, a.did) : NULL;
 	char plc[600];
 	EVP_PKEY_free(k);
 	snprintf(plc, sizeof plc, "%s/%s", plc_url ? plc_url : "", a.did);
@@ -1154,7 +1161,7 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 	         exec1(q("INSERT INTO account(did,handle,email,salt,hash,key,pubkey,plc_op) VALUES(?,?,?,?,?,?,?,?)", 8,
 	                 a.did, a.handle, email, a.salt, a.hash, pem, a.pubkey, op)) ||
 	         new_commit(a.did, &blocks, a.head, a.rev) || /* empty repo */
-	         account_events(a.did, a.handle) ||
+	         account_events(a.did, a.handle, 1) ||
 	         commit_event(a.did, NULL, NULL, a.head, a.rev, &blocks, NULL, 0) || (plc_url && post_json(plc, op));
 	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
 	free(pem), free(op), free(blocks.p);
@@ -1187,6 +1194,7 @@ static res get_session(struct MHD_Connection *c, cJSON *b) {
 	cJSON_AddStringToObject(o, "handle", a.handle);
 	cJSON_AddStringToObject(o, "did", a.did);
 	if (*a.email) cJSON_AddStringToObject(o, "email", a.email);
+	cJSON_AddItemToObject(o, "didDoc", did_doc(&a));
 	cJSON_AddBoolToObject(o, "active", 1);
 	return reply(c, 200, o);
 }
@@ -1241,6 +1249,88 @@ static cJSON *did_doc(const account *a) {
 	cJSON_AddItemToArray(arr, svc);
 	cJSON_AddItemToObject(d, "service", arr);
 	return d;
+}
+
+static int valid_domain(const char *h) {
+	size_t n = strlen(h), label = 0;
+	int dots = 0, alpha_tld = 0;
+	if (n < 3 || n > 253) return 0;
+	for (size_t i = 0; i <= n; i++) {
+		if (h[i] == '.' || !h[i]) {
+			if (!label || label > 63 || h[i - 1] == '-' || h[i - label] == '-') return 0;
+			dots += h[i] == '.', label = 0, alpha_tld = 0;
+		} else if (islower((unsigned char)h[i]) || isdigit((unsigned char)h[i]) || h[i] == '-') {
+			label++, alpha_tld |= islower((unsigned char)h[i]);
+		} else {
+			return 0;
+		}
+	}
+	return dots && alpha_tld;
+}
+
+/* Custom-domain handles must serve our DID at https://<handle>/.well-known/atproto-did.
+ * ponytail: the DNS TXT (_atproto.<handle>) method isn't checked; add it with
+ * res_query if users want DNS-only handles. */
+static int domain_points_to(const char *handle, const char *did) {
+	char url[300];
+	buf r = {0};
+	snprintf(url, sizeof url, "https://%s/.well-known/atproto-did", handle);
+	long code = http(url, NULL, NULL, 0, &r, NULL);
+	while (r.n && isspace(r.p[r.n - 1])) r.n--;
+	int ok = code == 200 && r.n == strlen(did) && !memcmp(r.p, did, r.n);
+	free(r.p);
+	return ok;
+}
+
+static res update_handle(struct MHD_Connection *c, cJSON *b) {
+	char did[64], handle[256], prev[64], plc[600];
+	account a, other;
+	if (auth(c, "com.atproto.access", did) || find_account(did, 0, &a))
+		return err(c, 401, "AuthenticationRequired", "invalid or expired token");
+	const char *h = str(b, "handle");
+	if (!h || strlen(h) >= sizeof handle) return err(c, 400, "InvalidHandle", "handle is required");
+	for (size_t i = 0; (handle[i] = (char)tolower((unsigned char)h[i])); i++);
+	if (!valid_handle(handle) && !(valid_domain(handle) && domain_points_to(handle, did)))
+		return err(c, 400, "InvalidHandle", "handle must be <name>.<hostname> or a domain serving your DID");
+	if (!find_account(handle, 0, &other) && strcmp(other.did, did))
+		return err(c, 400, "HandleNotAvailable", "handle already taken");
+
+	sqlite3_stmt *s = q("SELECT key, plc_op FROM account WHERE did=?", 1, did);
+	sqlite3_step(s);
+	EVP_PKEY *k = load_key((const char *)sqlite3_column_text(s, 0));
+	cJSON *last = cJSON_Parse((const char *)sqlite3_column_text(s, 1));
+	sqlite3_finalize(s);
+	buf lb = {0};
+	unsigned char lc[36];
+	char *op = NULL;
+	if (k && last && !cbor(&lb, last)) {
+		cid_of(&lb, lc);
+		cid_str(lc, prev);
+		op = plc_op(k, a.pubkey, handle, prev, a.did);
+	}
+	EVP_PKEY_free(k), cJSON_Delete(last), free(lb.p);
+	snprintf(plc, sizeof plc, "%s/%s", plc_url ? plc_url : "", did);
+	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+	int rc = !op || exec1(q("UPDATE account SET handle=?, plc_op=? WHERE did=?", 3, handle, op, did)) ||
+	         account_events(did, handle, 0) || (plc_url && post_json(plc, op));
+	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
+	free(op);
+	broadcast();
+	return rc ? err(c, 500, "InternalServerError", "could not update handle")
+	          : send_body(c, 200, "application/json", strdup("{}"));
+}
+
+/* The PDS's own did:web document. */
+static res service_did_doc(struct MHD_Connection *c) {
+	cJSON *d = cJSON_CreateObject(), *svc = cJSON_CreateObject(), *arr = cJSON_CreateArray();
+	cJSON_AddItemToObject(d, "@context", cJSON_CreateStringArray((const char *[]){"https://www.w3.org/ns/did/v1"}, 1));
+	cJSON_AddStringToObject(d, "id", service_did);
+	cJSON_AddStringToObject(svc, "id", "#atproto_pds");
+	cJSON_AddStringToObject(svc, "type", "AtprotoPersonalDataServer");
+	cJSON_AddStringToObject(svc, "serviceEndpoint", endpoint);
+	cJSON_AddItemToArray(arr, svc);
+	cJSON_AddItemToObject(d, "service", arr);
+	return reply(c, 200, d);
 }
 
 static res describe_repo(struct MHD_Connection *c, cJSON *b) {
@@ -1644,6 +1734,7 @@ static const struct {
     {"/xrpc/com.atproto.server.refreshSession", 1, refresh_session},
     {"/xrpc/com.atproto.server.deleteSession", 1, delete_session},
     {"/xrpc/com.atproto.identity.resolveHandle", 0, resolve_handle},
+    {"/xrpc/com.atproto.identity.updateHandle", 1, update_handle},
     {"/xrpc/com.atproto.repo.describeRepo", 0, describe_repo},
     {"/xrpc/com.atproto.repo.getRecord", 0, get_record},
     {"/xrpc/com.atproto.repo.listRecords", 0, list_records},
@@ -1725,7 +1816,7 @@ static res handler(void *cls, struct MHD_Connection *c, const char *url, const c
 	if (bd->too_big && strcmp(url, "/xrpc/com.atproto.repo.uploadBlob"))
 		return err(c, 413, "PayloadTooLarge", "request body too large");
 	const char *nsid = !strncmp(url, "/xrpc/", 6) ? url + 6 : "";
-	int known = !strcmp(url, "/.well-known/atproto-did") || !strcmp(nsid, "com.atproto.repo.uploadBlob");
+	int known = !strncmp(url, "/.well-known/", 13) || !strcmp(nsid, "com.atproto.repo.uploadBlob");
 	for (size_t i = 0; i < sizeof routes / sizeof *routes; i++) known |= !strcmp(url, routes[i].path);
 	if (!known && valid_nsid(nsid) &&
 	    (!strncmp(nsid, "app.bsky.", 9) || MHD_lookup_connection_value(c, MHD_HEADER_KIND, "atproto-proxy")))
@@ -1738,6 +1829,7 @@ static res handler(void *cls, struct MHD_Connection *c, const char *url, const c
 
 static res dispatch(struct MHD_Connection *c, const char *url, const char *method, body *bd) {
 	if (!strcmp(url, "/.well-known/atproto-did")) return well_known_did(c);
+	if (!strcmp(url, "/.well-known/did.json")) return service_did_doc(c);
 	if (!strcmp(url, "/xrpc/com.atproto.repo.uploadBlob"))
 		return strcmp(method, "POST") ? err(c, 405, "InvalidRequest", "wrong HTTP method") : upload_blob(c, bd);
 	for (size_t i = 0; i < sizeof routes / sizeof *routes; i++) {

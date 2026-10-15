@@ -80,6 +80,13 @@ curl -s -H "Authorization: Bearer $TOK" "$U/app.bsky.feed.getTimeline" | grep -q
 curl -s -H "Authorization: Bearer $TOK" "$U/com.atproto.server.getServiceAuth?aud=did:web:x.test&lxm=a.b.c" | grep -q token || fail serviceAuth
 curl -s -H "Authorization: Bearer $TOK" "$U/com.atproto.server.getServiceAuth?aud=did:web:x.test&exp=99999999999" | grep -q BadExpiration || fail serviceAuth-exp
 
+# identity: session carries didDoc, PDS serves its did:web doc, handle changes
+TOK= post com.atproto.server.createSession '{"identifier":"a@x.io","password":"pw"}' | grep -q '"didDoc":{' || fail session-didDoc
+curl -s "http://localhost:$PORT/.well-known/did.json" | grep -q '"id":"did:web:localhost"' || fail did.json
+post com.atproto.identity.updateHandle '{"handle":"Alice2.localhost"}' | grep -q '^{}$' || fail updateHandle
+get "com.atproto.identity.resolveHandle?handle=alice2.localhost" | grep -q "$DID" || fail resolve-new-handle
+post com.atproto.identity.updateHandle '{"handle":"alice.localhost"}' >/dev/null
+
 # firehose handshake (RFC 6455 sample key -> known accept value)
 curl -s -i --max-time 1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
   -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$U/com.atproto.sync.subscribeRepos?cursor=0" 2>/dev/null |
