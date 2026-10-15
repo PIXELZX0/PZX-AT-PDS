@@ -3,7 +3,7 @@
 set -eu
 PORT=${PORT:-2599}
 DB=$(mktemp -d)/t.sqlite
-PDS_PORT=$PORT PDS_DB=$DB PDS_JWT_SECRET=test ./pds 2>/dev/null &
+PDS_PORT=$PORT PDS_DB=$DB PDS_JWT_SECRET=test PDS_APPVIEW_URL=http://127.0.0.1:9 ./pds 2>/dev/null &
 PID=$!
 trap 'kill $PID' EXIT
 for _ in $(seq 50); do curl -s localhost:$PORT >/dev/null && break; sleep 0.1; done
@@ -72,6 +72,13 @@ curl -s -D - -o /dev/null "$U/com.atproto.sync.getBlob?did=$DID&cid=$WANT" | gre
 get "com.atproto.sync.listBlobs?did=$DID" | grep -q "$WANT" || fail listBlobs
 head -c 6000000 /dev/zero | curl -s -X POST -H "Authorization: Bearer $TOK" --data-binary @- "$U/com.atproto.repo.uploadBlob" | grep -q BlobTooLarge || fail blob-limit
 post com.atproto.repo.putRecord "{\"repo\":\"$DID\",\"collection\":\"app.bsky.actor.profile\",\"rkey\":\"self\",\"record\":{\"avatar\":$(echo "$R" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["blob"]))')}}" | grep -q commit || fail avatar
+
+# preferences stay local; other app.bsky.* calls are proxied (AppView unreachable here)
+post app.bsky.actor.putPreferences '{"preferences":[{"$type":"app.bsky.actor.defs#savedFeedsPrefV2","items":[]}]}' >/dev/null
+curl -s -H "Authorization: Bearer $TOK" "$U/app.bsky.actor.getPreferences" | grep -q savedFeedsPrefV2 || fail prefs
+curl -s -H "Authorization: Bearer $TOK" "$U/app.bsky.feed.getTimeline" | grep -q UpstreamFailure || fail proxy
+curl -s -H "Authorization: Bearer $TOK" "$U/com.atproto.server.getServiceAuth?aud=did:web:x.test&lxm=a.b.c" | grep -q token || fail serviceAuth
+curl -s -H "Authorization: Bearer $TOK" "$U/com.atproto.server.getServiceAuth?aud=did:web:x.test&exp=99999999999" | grep -q BadExpiration || fail serviceAuth-exp
 
 # firehose handshake (RFC 6455 sample key -> known accept value)
 curl -s -i --max-time 1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \

@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -38,6 +39,10 @@
 
 static sqlite3 *db;
 static const char *hostname, *plc_url, *crawler; /* NULL: stay local */
+static const char *appview_url, *appview_did;
+/* ponytail: one recursive lock serializes all state (sqlite, subscribers,
+ * caches); only proxied calls run outside it. Finer locks if contention shows. */
+static pthread_mutex_t big;
 static char endpoint[300], service_did[300];
 static unsigned char jwt_secret[32];
 
@@ -695,10 +700,7 @@ static void broadcast(void) {
 /* ponytail: sends are blocking with a 5s timeout on the single server thread,
  * so one stuck subscriber can stall everyone briefly, and incoming frames
  * (ping/close) are never read. Move to per-subscriber queues + poll if needed. */
-static void on_upgrade(void *cls, struct MHD_Connection *c, void *req_cls, const char *extra, size_t extra_n,
-                       MHD_socket fd, struct MHD_UpgradeResponseHandle *urh) {
-	(void)c, (void)req_cls, (void)extra, (void)extra_n;
-	long long cursor = (long long)(intptr_t)cls - 1;
+static void subscribe(long long cursor, MHD_socket fd, struct MHD_UpgradeResponseHandle *urh) {
 	struct timeval tv = {5, 0};
 	int one = 1;
 	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
@@ -735,32 +737,54 @@ static void on_upgrade(void *cls, struct MHD_Connection *c, void *req_cls, const
 	subs[nsubs++].urh = urh;
 }
 
+static void on_upgrade(void *cls, struct MHD_Connection *c, void *req_cls, const char *extra, size_t extra_n,
+                       MHD_socket fd, struct MHD_UpgradeResponseHandle *urh) {
+	(void)c, (void)req_cls, (void)extra, (void)extra_n;
+	pthread_mutex_lock(&big);
+	subscribe((long long)(intptr_t)cls - 1, fd, urh);
+	pthread_mutex_unlock(&big);
+}
+
 /* ---------- outbound: PLC directory, relays ---------- */
 
-static size_t discard(char *p, size_t size, size_t n, void *u) {
-	(void)p, (void)u;
+static size_t collect(char *p, size_t size, size_t n, void *u) {
+	if (u) put(u, p, size * n);
 	return size * n;
 }
 
-/* ponytail: synchronous, on the server thread (10s timeout). Fine for account
- * creation and startup; queue it if outbound calls become frequent. */
-static int post_json(const char *url, const char *body) {
+/* POSTs when body is non-NULL. Returns the HTTP status, 0 if unreachable. */
+static long http(const char *url, struct curl_slist *hdrs, const void *body, size_t n, buf *out, char ctype[128]) {
 	CURL *c = curl_easy_init();
-	if (!c) return -1;
-	struct curl_slist *h = curl_slist_append(NULL, "Content-Type: application/json");
 	long code = 0;
+	char *ct = NULL;
+	if (!c) return 0;
 	curl_easy_setopt(c, CURLOPT_URL, url);
-	curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
-	curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
-	curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, discard);
-	int rc = curl_easy_perform(c) == CURLE_OK ? 0 : -1;
-	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-	if (code / 100 != 2) rc = -1;
-	curl_slist_free_all(h);
+	curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
+	curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, collect);
+	curl_easy_setopt(c, CURLOPT_WRITEDATA, out);
+	if (body) {
+		curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
+		curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)n);
+	}
+	if (curl_easy_perform(c) == CURLE_OK) {
+		curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+		curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &ct);
+		if (ctype) snprintf(ctype, 128, "%s", ct ? ct : "application/octet-stream");
+	}
 	curl_easy_cleanup(c);
-	if (rc) fprintf(stderr, "POST %s failed (HTTP %ld)\n", url, code);
-	return rc;
+	return code;
+}
+
+/* ponytail: synchronous, holding the global lock (30s timeout). Fine for
+ * account creation and startup; queue it if outbound calls become frequent. */
+static int post_json(const char *url, const char *body) {
+	struct curl_slist *h = curl_slist_append(NULL, "Content-Type: application/json");
+	long code = http(url, h, body, strlen(body), NULL, NULL);
+	curl_slist_free_all(h);
+	if (code / 100 == 2) return 0;
+	fprintf(stderr, "POST %s failed (HTTP %ld)\n", url, code);
+	return -1;
 }
 
 /* Signed PLC genesis op as JSON; the DID is derived from its hash.
@@ -906,6 +930,178 @@ static res session(struct MHD_Connection *c, const account *a) {
 	return reply(c, 200, o);
 }
 
+/* ---------- service auth + proxying to other services ---------- */
+
+typedef struct { char *p; size_t n; int too_big; } body;
+
+/* ES256K JWT signed with the user's repo key, proving the user to `aud`. */
+static int service_jwt(const char *did, const char *aud, const char *lxm, long ttl, char out[2048]) {
+	sqlite3_stmt *s = q("SELECT key FROM account WHERE did=?", 1, did);
+	EVP_PKEY *k = sqlite3_step(s) == SQLITE_ROW ? load_key((const char *)sqlite3_column_text(s, 0)) : NULL;
+	sqlite3_finalize(s);
+	if (!k) return -1;
+	unsigned char rnd[16], sig[64];
+	char jti[33];
+	long now = (long)time(NULL);
+	RAND_bytes(rnd, sizeof rnd);
+	hex(rnd, sizeof rnd, jti);
+	cJSON *p = cJSON_CreateObject();
+	cJSON_AddNumberToObject(p, "iat", (double)now);
+	cJSON_AddStringToObject(p, "iss", did);
+	cJSON_AddStringToObject(p, "aud", aud);
+	cJSON_AddNumberToObject(p, "exp", (double)(now + ttl));
+	if (lxm) cJSON_AddStringToObject(p, "lxm", lxm);
+	cJSON_AddStringToObject(p, "jti", jti);
+	char *pj = cJSON_PrintUnformatted(p);
+	cJSON_Delete(p);
+	const char *hj = "{\"typ\":\"JWT\",\"alg\":\"ES256K\"}";
+	int rc = strlen(pj) > 1000 ? -1 : 0;
+	if (!rc) {
+		b64url((const unsigned char *)hj, strlen(hj), out);
+		size_t n = strlen(out);
+		out[n++] = '.';
+		b64url((const unsigned char *)pj, strlen(pj), out + n);
+		buf m = {(unsigned char *)out, strlen(out), 0};
+		rc = sign(k, &m, sig);
+		n = strlen(out);
+		out[n++] = '.';
+		b64url(sig, sizeof sig, out + n);
+	}
+	free(pj);
+	EVP_PKEY_free(k);
+	return rc;
+}
+
+static struct { char ref[256], url[512]; } svc_cache[16];
+static int nsvc;
+
+/* "did:web:host#id" → that service's endpoint from host's did.json.
+ * ponytail: did:web only, cached in memory forever. */
+static int resolve_service(const char *ref, char aud[256], char url[512]) {
+	const char *frag = strchr(ref, '#');
+	if (!frag || strncmp(ref, "did:web:", 8) || strlen(ref) >= 256) return -1;
+	snprintf(aud, 256, "%.*s", (int)(frag - ref), ref);
+	for (int i = 0; i < nsvc; i++)
+		if (!strcmp(svc_cache[i].ref, ref)) return snprintf(url, 512, "%s", svc_cache[i].url), 0;
+	char host[256], doc[300], *pc;
+	snprintf(host, sizeof host, "%s", aud + 8);
+	if ((pc = strstr(host, "%3A")) || (pc = strstr(host, "%3a"))) *pc = ':', memmove(pc + 1, pc + 3, strlen(pc + 3) + 1);
+	if (strpbrk(host, "/%?#@")) return -1;
+	int dev = !strcmp(host, "localhost") || !strncmp(host, "localhost:", 10);
+	snprintf(doc, sizeof doc, "%s://%s/.well-known/did.json", dev ? "http" : "https", host);
+	buf r = {0};
+	long code = http(doc, NULL, NULL, 0, &r, NULL);
+	put(&r, "", 1);
+	cJSON *d = code == 200 ? cJSON_Parse((char *)r.p) : NULL, *svc;
+	free(r.p);
+	int rc = -1;
+	size_t al = strlen(aud);
+	cJSON_ArrayForEach(svc, cJSON_GetObjectItemCaseSensitive(d, "service")) {
+		const char *id = str(svc, "id"), *ep = str(svc, "serviceEndpoint");
+		if (id && ep && (!strcmp(id, frag) || (!strncmp(id, aud, al) && !strcmp(id + al, frag)))) {
+			snprintf(url, 512, "%s", ep);
+			rc = 0;
+			break;
+		}
+	}
+	cJSON_Delete(d);
+	if (!rc && nsvc < 16) {
+		snprintf(svc_cache[nsvc].ref, sizeof svc_cache[nsvc].ref, "%s", ref);
+		snprintf(svc_cache[nsvc++].url, sizeof svc_cache[0].url, "%s", url);
+	}
+	return rc;
+}
+
+static enum MHD_Result add_arg(void *cls, enum MHD_ValueKind kind, const char *k, const char *v) {
+	(void)kind;
+	buf *b = cls;
+	char *ek = curl_easy_escape(NULL, k, 0), *ev = v ? curl_easy_escape(NULL, v, 0) : NULL;
+	put(b, memchr(b->p, '?', b->n) ? "&" : "?", 1);
+	put(b, ek, strlen(ek));
+	if (ev) put(b, "=", 1), put(b, ev, strlen(ev));
+	curl_free(ek), curl_free(ev);
+	return MHD_YES;
+}
+
+/* Forwards an XRPC call to the AppView, or to the service named by the
+ * atproto-proxy header, authenticated as the user with a service JWT.
+ * Runs without the global lock except for key/cache access. */
+static res proxy(struct MHD_Connection *c, const char *method, const char *nsid, const body *bd) {
+	const char *target = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "atproto-proxy"),
+	           *authz = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Authorization");
+	char did[64], aud[256], base[512], tok[2048], line[2200], ctype[128];
+	/* resolving arbitrary did:web hosts is only for signed-in users */
+	if ((authz || target) && auth(c, "com.atproto.access", did))
+		return err(c, 401, "AuthenticationRequired", "invalid or expired token");
+	pthread_mutex_lock(&big);
+	int rc = target ? resolve_service(target, aud, base)
+	                : (snprintf(aud, sizeof aud, "%s", appview_did), snprintf(base, sizeof base, "%s", appview_url), 0);
+	if (!rc && authz && service_jwt(did, aud, nsid, 60, tok)) rc = -2;
+	pthread_mutex_unlock(&big);
+	if (rc == -1) return err(c, 400, "InvalidRequest", "could not resolve atproto-proxy service");
+	if (rc) return err(c, 500, "InternalServerError", "could not sign service token");
+
+	buf u = {0}, out = {0};
+	put(&u, base, strlen(base)), put(&u, "/xrpc/", 6), put(&u, nsid, strlen(nsid));
+	MHD_get_connection_values(c, MHD_GET_ARGUMENT_KIND, add_arg, &u);
+	put(&u, "", 1);
+	struct curl_slist *h = NULL;
+	if (authz) snprintf(line, sizeof line, "Authorization: Bearer %s", tok), h = curl_slist_append(h, line);
+	const char *fwd[] = {"Content-Type", "Accept-Language", "atproto-accept-labelers"};
+	for (int i = 0; i < 3; i++) {
+		const char *v = MHD_lookup_connection_value(c, MHD_HEADER_KIND, fwd[i]);
+		if (v && strlen(v) < 1000) snprintf(line, sizeof line, "%s: %s", fwd[i], v), h = curl_slist_append(h, line);
+	}
+	int post = !strcmp(method, "POST");
+	long code = http((char *)u.p, h, post ? (bd && bd->n ? bd->p : "") : NULL, post && bd ? bd->n : 0, &out, ctype);
+	curl_slist_free_all(h);
+	free(u.p);
+	if (!code) {
+		free(out.p);
+		return err(c, 502, "UpstreamFailure", "upstream service unreachable");
+	}
+	return send_raw(c, (unsigned)code, ctype, out.p ? out.p : malloc(1), out.n);
+}
+
+static res get_service_auth(struct MHD_Connection *c, cJSON *b) {
+	(void)b;
+	char did[64], tok[2048];
+	const char *aud = ARG("aud"), *lxm = ARG("lxm"), *exp = ARG("exp");
+	if (auth(c, "com.atproto.access", did)) return err(c, 401, "AuthenticationRequired", "invalid or expired token");
+	if (!aud || strncmp(aud, "did:", 4) || strlen(aud) > 256 || (lxm && strlen(lxm) > 256))
+		return err(c, 400, "InvalidRequest", "aud must be a DID");
+	long ttl = exp ? atol(exp) - (long)time(NULL) : 60;
+	if (ttl <= 0 || ttl > 3600) return err(c, 400, "BadExpiration", "exp must be within the next hour");
+	if (service_jwt(did, aud, lxm, ttl, tok)) return err(c, 500, "InternalServerError", "could not sign token");
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "token", tok);
+	return reply(c, 200, o);
+}
+
+/* app.bsky.actor preferences live on the PDS, not the AppView. */
+static res get_prefs(struct MHD_Connection *c, cJSON *b) {
+	(void)b;
+	char did[64];
+	if (auth(c, "com.atproto.access", did)) return err(c, 401, "AuthenticationRequired", "invalid or expired token");
+	sqlite3_stmt *s = q("SELECT prefs FROM pref WHERE did=?", 1, did);
+	cJSON *o = cJSON_CreateObject(),
+	      *p = sqlite3_step(s) == SQLITE_ROW ? cJSON_Parse((const char *)sqlite3_column_text(s, 0)) : NULL;
+	sqlite3_finalize(s);
+	cJSON_AddItemToObject(o, "preferences", p ? p : cJSON_CreateArray());
+	return reply(c, 200, o);
+}
+
+static res put_prefs(struct MHD_Connection *c, cJSON *b) {
+	char did[64];
+	if (auth(c, "com.atproto.access", did)) return err(c, 401, "AuthenticationRequired", "invalid or expired token");
+	cJSON *p = cJSON_GetObjectItemCaseSensitive(b, "preferences");
+	if (!cJSON_IsArray(p)) return err(c, 400, "InvalidRequest", "preferences must be an array");
+	char *json = cJSON_PrintUnformatted(p);
+	int rc = exec1(q("INSERT OR REPLACE INTO pref(did, prefs) VALUES(?,?)", 2, did, json));
+	free(json);
+	return rc ? err(c, 500, "InternalServerError", "write failed") : send_body(c, 200, "application/json", strdup("{}"));
+}
+
 /* ---------- XRPC handlers ---------- */
 
 static res health(struct MHD_Connection *c, cJSON *b) {
@@ -1015,8 +1211,8 @@ static res resolve_handle(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
 	account a;
 	const char *h = ARG("handle");
-	if (!h || strncmp(h, "did:", 4) == 0 || find_account(h, 0, &a))
-		return err(c, 400, "HandleNotFound", "unable to resolve handle");
+	if (!h || strncmp(h, "did:", 4) == 0) return err(c, 400, "InvalidRequest", "handle is required");
+	if (find_account(h, 0, &a)) return proxy(c, "GET", "com.atproto.identity.resolveHandle", NULL);
 	cJSON *o = cJSON_CreateObject();
 	cJSON_AddStringToObject(o, "did", a.did);
 	return reply(c, 200, o);
@@ -1376,6 +1572,9 @@ static const struct {
     {"/xrpc/com.atproto.sync.listRepos", 0, list_repos},
     {"/xrpc/com.atproto.sync.subscribeRepos", 0, subscribe_repos},
     {"/xrpc/com.atproto.sync.getBlob", 0, get_blob},
+    {"/xrpc/com.atproto.server.getServiceAuth", 0, get_service_auth},
+    {"/xrpc/app.bsky.actor.getPreferences", 0, get_prefs},
+    {"/xrpc/app.bsky.actor.putPreferences", 1, put_prefs},
     {"/xrpc/com.atproto.sync.listBlobs", 0, list_blobs},
 };
 
@@ -1390,8 +1589,6 @@ static res well_known_did(struct MHD_Connection *c) {
 		return send_body(c, 404, "text/plain", strdup("not found"));
 	return send_body(c, 200, "text/plain", strdup(a.did));
 }
-
-typedef struct { char *p; size_t n; int too_big; } body;
 
 /* Raw body (not JSON); the blob's CID is a raw-codec CIDv1.
  * ponytail: blobs are kept forever, even if no record ever references them,
@@ -1419,6 +1616,8 @@ static res upload_blob(struct MHD_Connection *c, const body *bd) {
 	return reply(c, 200, o);
 }
 
+static res dispatch(struct MHD_Connection *c, const char *url, const char *method, body *bd);
+
 static res handler(void *cls, struct MHD_Connection *c, const char *url, const char *method, const char *ver,
                    const char *up, size_t *upsz, void **ctx) {
 	(void)cls, (void)ver;
@@ -1438,11 +1637,24 @@ static res handler(void *cls, struct MHD_Connection *c, const char *url, const c
 		return MHD_YES;
 	}
 	if (!strcmp(method, "OPTIONS")) return send_body(c, 204, "text/plain", strdup(""));
+	if (bd->too_big && strcmp(url, "/xrpc/com.atproto.repo.uploadBlob"))
+		return err(c, 413, "PayloadTooLarge", "request body too large");
+	const char *nsid = !strncmp(url, "/xrpc/", 6) ? url + 6 : "";
+	int known = !strcmp(url, "/.well-known/atproto-did") || !strcmp(nsid, "com.atproto.repo.uploadBlob");
+	for (size_t i = 0; i < sizeof routes / sizeof *routes; i++) known |= !strcmp(url, routes[i].path);
+	if (!known && valid_nsid(nsid) &&
+	    (!strncmp(nsid, "app.bsky.", 9) || MHD_lookup_connection_value(c, MHD_HEADER_KIND, "atproto-proxy")))
+		return proxy(c, method, nsid, bd);
+	pthread_mutex_lock(&big);
+	res r = dispatch(c, url, method, bd);
+	pthread_mutex_unlock(&big);
+	return r;
+}
+
+static res dispatch(struct MHD_Connection *c, const char *url, const char *method, body *bd) {
 	if (!strcmp(url, "/.well-known/atproto-did")) return well_known_did(c);
 	if (!strcmp(url, "/xrpc/com.atproto.repo.uploadBlob"))
 		return strcmp(method, "POST") ? err(c, 405, "InvalidRequest", "wrong HTTP method") : upload_blob(c, bd);
-	if (bd->too_big) return err(c, 413, "PayloadTooLarge", "request body too large");
-
 	for (size_t i = 0; i < sizeof routes / sizeof *routes; i++) {
 		if (strcmp(url, routes[i].path)) continue;
 		if (strcmp(method, routes[i].post ? "POST" : "GET"))
@@ -1489,7 +1701,13 @@ int main(void) {
 	int local = !strcmp(hostname, "localhost");
 	plc_url = env("PDS_PLC_URL", local ? NULL : "https://plc.directory");
 	crawler = env("PDS_CRAWLER", local ? NULL : "https://bsky.network");
+	appview_url = env("PDS_APPVIEW_URL", "https://api.bsky.app");
+	appview_did = env("PDS_APPVIEW_DID", "did:web:api.bsky.app");
 	curl_global_init(CURL_GLOBAL_DEFAULT);
+	pthread_mutexattr_t ma;
+	pthread_mutexattr_init(&ma);
+	pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&big, &ma);
 
 	if (sqlite3_open(env("PDS_DB", "pds.sqlite"), &db) ||
 	    sqlite3_exec(db,
@@ -1500,6 +1718,7 @@ int main(void) {
 	                 "CREATE TABLE IF NOT EXISTS record(did TEXT NOT NULL, collection TEXT NOT NULL,"
 	                 " rkey TEXT NOT NULL, cid TEXT NOT NULL, value TEXT NOT NULL,"
 	                 " PRIMARY KEY(did, collection, rkey));"
+	                 "CREATE TABLE IF NOT EXISTS pref(did TEXT PRIMARY KEY, prefs TEXT NOT NULL);"
 	                 "CREATE TABLE IF NOT EXISTS blob(did TEXT NOT NULL, cid TEXT NOT NULL, mime TEXT NOT NULL,"
 	                 " size INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(did, cid));"
 	                 "CREATE TABLE IF NOT EXISTS event(seq INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT NOT NULL,"
@@ -1513,9 +1732,8 @@ int main(void) {
 	sent_seq = sqlite3_column_int64(s, 0);
 	sqlite3_finalize(s);
 
-	/* ponytail: one polling thread serializes all requests (and sqlite access);
-	 * switch to a thread pool + per-thread connections if load demands it. */
-	struct MHD_Daemon *d = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG | MHD_ALLOW_UPGRADE,
+	struct MHD_Daemon *d = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION | MHD_USE_INTERNAL_POLLING_THREAD |
+	                                            MHD_USE_ERROR_LOG | MHD_ALLOW_UPGRADE,
 	                                        (uint16_t)port, NULL, NULL, handler, NULL, MHD_OPTION_NOTIFY_COMPLETED,
 	                                        done, NULL,
 	                                        MHD_OPTION_END);
