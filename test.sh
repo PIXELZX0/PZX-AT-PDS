@@ -100,7 +100,32 @@ curl -s -i --max-time 1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec
   -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$U/com.atproto.sync.subscribeRepos?cursor=0" 2>/dev/null |
   grep -q 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=' || fail subscribeRepos
 get com.atproto.sync.subscribeRepos | grep -q 'websocket upgrade required' || fail subscribeRepos-plain
-get com.atproto.admin.getAccountInfo | grep -q MethodNotImplemented || fail 501
+get com.example.no.method | grep -q MethodNotImplemented || fail 501
+# pdsadmin CLI against this server
+adm() { PDS_ENV_FILE=/dev/null PDS_HOSTNAME=localhost PDS_PORT=$PORT PDS_ADMIN_PASSWORD=${ADMPW:-adminpw} ./pdsadmin "$@"; }
+login() { TOK= post com.atproto.server.createSession "{\"identifier\":\"$1\",\"password\":\"$2\"}"; }
+adm create-invite-code | grep -q '^localhost-' || fail cli-invite
+ADMPW=nope adm create-invite-code 2>&1 | grep -q AuthenticationRequired || fail cli-badadmin
+OUT=$(adm account create carol@x.io carol.localhost)
+CDID=$(echo "$OUT" | sed -n 's/^DID      : //p'); CPW=$(echo "$OUT" | sed -n 's/^Password : //p')
+login carol.localhost "$CPW" | grep -q accessJwt || fail "cli-create $OUT"
+adm account list | grep -q "^carol.localhost  *carol@x.io  *$CDID" || fail cli-list
+adm account list | grep -q "alice.localhost" || fail cli-list-alice
+adm account takedown "$CDID" | grep -q 'taken down' || fail cli-takedown
+login carol.localhost "$CPW" | grep -q AccountTakedown || fail takedown-login
+get "com.atproto.sync.getRepoStatus?did=$CDID" | grep -q '"status":"takendown"' || fail takedown-status
+get "com.atproto.repo.describeRepo?repo=$CDID" | grep -q RepoTakendown || fail takedown-read
+adm account untakedown "$CDID" | grep -q 'untaken down' || fail cli-untakedown
+login carol.localhost "$CPW" | grep -q accessJwt || fail untakedown-login
+NPW=$(adm account reset-password "$CDID" | sed -n 's/^New password: //p')
+login carol.localhost "$CPW" | grep -q AuthenticationRequired || fail old-password
+login carol.localhost "$NPW" | grep -q accessJwt || fail new-password
+echo n | adm account delete "$CDID" >/dev/null; adm account list | grep -q carol.localhost || fail delete-declined
+echo y | adm account delete "$CDID" | grep -q "$CDID deleted" || fail cli-delete
+adm account list | grep -q carol.localhost && fail delete-listed
+get "com.atproto.repo.describeRepo?repo=$CDID" | grep -q RepoNotFound || fail delete-gone
+adm help | grep -q 'reset-password <DID>' || fail cli-help
+
 # Caddy on-demand TLS ask hook
 curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/tls-check?domain=localhost" | grep -q 200 || fail tls-host
 curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/tls-check?domain=Alice.localhost" | grep -q 200 || fail tls-handle

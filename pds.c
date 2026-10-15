@@ -39,7 +39,7 @@
 #define REFRESH_TTL (60 * 24 * 3600)
 
 static sqlite3 *db;
-static const char *hostname, *plc_url, *crawler; /* NULL: stay local */
+static const char *hostname, *plc_url, *crawlers; /* NULL: stay local */
 static const char *appview_url, *appview_did;
 /* ponytail: one recursive lock serializes all state (sqlite, subscribers,
  * caches); only proxied calls run outside it. Finer locks if contention shows. */
@@ -367,14 +367,17 @@ static int exec1(sqlite3_stmt *s) {
 	return rc == SQLITE_DONE ? 0 : -1;
 }
 
-typedef struct { char did[64], handle[256], email[256], salt[33], hash[65], pubkey[64], head[64], rev[16]; } account;
+typedef struct {
+	char did[64], handle[256], email[256], salt[33], hash[65], pubkey[64], head[64], rev[16];
+	int takedown;
+} account;
 
 /* ident may be a DID or handle; with_email also matches email. */
 static int find_account(const char *ident, int with_email, account *a) {
 	if (!ident) return -1;
-	sqlite3_stmt *s = q(with_email ? "SELECT did,handle,ifnull(email,''),salt,hash,pubkey,ifnull(head,''),ifnull(rev,'') FROM account "
+	sqlite3_stmt *s = q(with_email ? "SELECT did,handle,ifnull(email,''),salt,hash,pubkey,ifnull(head,''),ifnull(rev,''),takedown IS NOT NULL FROM account "
 	                                 "WHERE did=?1 OR handle=lower(?1) OR lower(email)=lower(?1)"
-	                               : "SELECT did,handle,ifnull(email,''),salt,hash,pubkey,ifnull(head,''),ifnull(rev,'') FROM account "
+	                               : "SELECT did,handle,ifnull(email,''),salt,hash,pubkey,ifnull(head,''),ifnull(rev,''),takedown IS NOT NULL FROM account "
 	                                 "WHERE did=?1 OR handle=lower(?1)",
 	                    1, ident);
 	int found = sqlite3_step(s) == SQLITE_ROW;
@@ -387,6 +390,7 @@ static int find_account(const char *ident, int with_email, account *a) {
 		snprintf(a->pubkey, sizeof a->pubkey, "%s", sqlite3_column_text(s, 5));
 		snprintf(a->head, sizeof a->head, "%s", sqlite3_column_text(s, 6));
 		snprintf(a->rev, sizeof a->rev, "%s", sqlite3_column_text(s, 7));
+		a->takedown = sqlite3_column_int(s, 8);
 	}
 	sqlite3_finalize(s);
 	return found ? 0 : -1;
@@ -643,23 +647,34 @@ static int commit_event(const char *did, const char *since, const unsigned char 
 	return event_end(seq, &f);
 }
 
-/* #identity then #account (when announcing a new account) or #identity alone. */
-static int account_events(const char *did, const char *handle, int with_account) {
+static int identity_event(const char *did, const char *handle) {
 	char t[32];
+	buf f = {0};
+	long long seq = event_begin(did, &f, "#identity");
+	if (seq < 0) return -1;
 	now_iso(t);
-	for (int i = 0; i < 1 + with_account; i++) {
-		buf f = {0};
-		long long seq = event_begin(did, &f, i ? "#account" : "#identity");
-		if (seq < 0) return -1;
-		head(&f, 5, 4);
-		text(&f, "did"), text(&f, did);
-		text(&f, "seq"), head(&f, 0, (uint64_t)seq);
-		text(&f, "time"), text(&f, t);
-		if (i) text(&f, "active"), put(&f, "\xf5", 1);
-		else text(&f, "handle"), text(&f, handle);
-		if (event_end(seq, &f)) return -1;
-	}
-	return 0;
+	head(&f, 5, 4);
+	text(&f, "did"), text(&f, did);
+	text(&f, "seq"), head(&f, 0, (uint64_t)seq);
+	text(&f, "time"), text(&f, t);
+	text(&f, "handle"), text(&f, handle);
+	return event_end(seq, &f);
+}
+
+/* #account: status is NULL when active, else e.g. "takendown", "deleted". */
+static int account_event(const char *did, const char *status) {
+	char t[32];
+	buf f = {0};
+	long long seq = event_begin(did, &f, "#account");
+	if (seq < 0) return -1;
+	now_iso(t);
+	head(&f, 5, status ? 5 : 4);
+	text(&f, "did"), text(&f, did);
+	text(&f, "seq"), head(&f, 0, (uint64_t)seq);
+	text(&f, "time"), text(&f, t);
+	text(&f, "active"), put(&f, status ? "\xf4" : "\xf5", 1);
+	if (status) text(&f, "status"), text(&f, status);
+	return event_end(seq, &f);
 }
 
 #define MAX_SUBS 256
@@ -831,13 +846,18 @@ static char *plc_op(EVP_PKEY *k, const char *pubkey, const char *handle, const c
 	return json;
 }
 
-/* Asks the relay to start crawling (it then subscribes to our firehose). */
+/* Asks each relay in PDS_CRAWLERS (comma-separated) to crawl us; they then
+ * subscribe to our firehose. */
 static void request_crawl(void) {
-	char url[512], body[300];
-	if (!crawler) return;
-	snprintf(url, sizeof url, "%s/xrpc/com.atproto.sync.requestCrawl", crawler);
+	char url[512], body[300], *list, *save;
+	if (!crawlers) return;
 	snprintf(body, sizeof body, "{\"hostname\":\"%s\"}", hostname);
-	post_json(url, body);
+	list = strdup(crawlers);
+	for (char *h = strtok_r(list, ",", &save); h; h = strtok_r(NULL, ",", &save)) {
+		snprintf(url, sizeof url, "%s/xrpc/com.atproto.sync.requestCrawl", h + strspn(h, " "));
+		post_json(url, body);
+	}
+	free(list);
 }
 
 /* ---------- validation ---------- */
@@ -918,9 +938,16 @@ static const char *str(const cJSON *o, const char *k) {
 	return cJSON_IsString(v) ? v->valuestring : NULL;
 }
 
+/* Valid bearer token for an account that still exists and isn't taken down. */
 static int auth(struct MHD_Connection *c, const char *scope, char did[64]) {
 	const char *h = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Authorization");
-	return h && !strncmp(h, "Bearer ", 7) ? verify_jwt(h + 7, scope, did) : -1;
+	if (!h || strncmp(h, "Bearer ", 7) || verify_jwt(h + 7, scope, did)) return -1;
+	pthread_mutex_lock(&big);
+	sqlite3_stmt *s = q("SELECT 1 FROM account WHERE did=? AND takedown IS NULL", 1, did);
+	int ok = sqlite3_step(s) == SQLITE_ROW;
+	sqlite3_finalize(s);
+	pthread_mutex_unlock(&big);
+	return ok ? 0 : -1;
 }
 
 static cJSON *did_doc(const account *a);
@@ -1121,15 +1148,20 @@ static res put_prefs(struct MHD_Connection *c, cJSON *b) {
 static struct { time_t start; int n; } rl[RL_SLOTS];
 static uint64_t rl_seed;
 
-/* Counts one attempt for kind+key; true once more than max in window seconds. */
-static int rate_limited(const char *kind, const char *key, int max, int window) {
+/* The counter for kind+key in the current window. */
+static int *rl_slot(const char *kind, const char *key, int window) {
 	uint64_t h = 1469598103934665603ULL ^ rl_seed;
 	for (const char *p = kind; *p; p++) h = (h ^ (unsigned char)*p) * 1099511628211ULL;
 	h = (h ^ ':') * 1099511628211ULL;
 	for (const char *p = key; *p; p++) h = (h ^ (unsigned char)tolower((unsigned char)*p)) * 1099511628211ULL;
 	time_t now = time(NULL);
 	if (now - rl[h % RL_SLOTS].start >= window) rl[h % RL_SLOTS].start = now, rl[h % RL_SLOTS].n = 0;
-	return ++rl[h % RL_SLOTS].n > max;
+	return &rl[h % RL_SLOTS].n;
+}
+
+/* Counts one attempt; true once there were more than max in the window. */
+static int rate_limited(const char *kind, const char *key, int max, int window) {
+	return ++*rl_slot(kind, key, window) > max;
 }
 
 /* Socket peer, or with PDS_TRUST_PROXY the address our reverse proxy saw
@@ -1155,6 +1187,14 @@ static res too_many(struct MHD_Connection *c) {
 }
 
 /* ---------- XRPC handlers ---------- */
+
+/* 0 if the repo exists and is live; otherwise queues an error into *e. */
+static int find_repo(struct MHD_Connection *c, const char *ident, int did_only, account *a, res *e) {
+	if (!ident || (did_only && strncmp(ident, "did:", 4)) || find_account(ident, 0, a))
+		return *e = err(c, 400, "RepoNotFound", "could not find repo"), -1;
+	if (a->takedown) return *e = err(c, 400, "RepoTakendown", "repo has been taken down"), -1;
+	return 0;
+}
 
 static res health(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
@@ -1211,13 +1251,16 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 	EVP_PKEY_free(k);
 	snprintf(plc, sizeof plc, "%s/%s", plc_url ? plc_url : "", a.did);
 	buf blocks = {0};
+	char now[32];
+	now_iso(now);
 	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
 	int rc = !op ||
 	         (invite_required && exec1(q("UPDATE invite SET uses_left=uses_left-1 WHERE code=?", 1, code))) ||
-	         exec1(q("INSERT INTO account(did,handle,email,salt,hash,key,pubkey,plc_op) VALUES(?,?,?,?,?,?,?,?)", 8,
-	                 a.did, a.handle, email, a.salt, a.hash, pem, a.pubkey, op)) ||
+	         exec1(q("INSERT INTO account(did,handle,email,salt,hash,key,pubkey,plc_op,created_at) "
+	                 "VALUES(?,?,?,?,?,?,?,?,?)",
+	                 9, a.did, a.handle, email, a.salt, a.hash, pem, a.pubkey, op, now)) ||
 	         new_commit(a.did, &blocks, a.head, a.rev) || /* empty repo */
-	         account_events(a.did, a.handle, 1) ||
+	         identity_event(a.did, a.handle) || account_event(a.did, NULL) ||
 	         commit_event(a.did, NULL, NULL, a.head, a.rev, &blocks, NULL, 0) || (plc_url && post_json(plc, op));
 	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
 	free(pem), free(op), free(blocks.p);
@@ -1228,14 +1271,104 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 }
 
 /* Admin calls use HTTP Basic auth as user "admin" with PDS_ADMIN_PASSWORD. */
-static int admin(struct MHD_Connection *c) {
+/* 0 if admin; otherwise queues an error into *e. After 20 failures from an
+ * IP in 5 minutes, that IP is refused before the password is even compared. */
+static int admin(struct MHD_Connection *c, res *e) {
 	const char *h = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Authorization");
 	size_t n = strlen(admin_basic);
-	return n && h && strlen(h) == n && !CRYPTO_memcmp(h, admin_basic, n) ? 0 : -1;
+	char ip[64];
+	client_ip(c, ip);
+	int *fails = rl_slot("admin-fail", ip, 300);
+	if (*fails >= 20) return *e = too_many(c), -1;
+	if (n && h && strlen(h) == n && !CRYPTO_memcmp(h, admin_basic, n)) return 0;
+	++*fails;
+	return *e = err(c, 401, "AuthenticationRequired", "admin auth required"), -1;
+}
+
+static res admin_get_account_info(struct MHD_Connection *c, cJSON *b) {
+	(void)b;
+	res e;
+	account a;
+	if (admin(c, &e)) return e;
+	const char *d = ARG("did");
+	if (!d || strncmp(d, "did:", 4) || find_account(d, 0, &a))
+		return err(c, 400, "AccountNotFound", "account not found");
+	sqlite3_stmt *s = q("SELECT ifnull(created_at, '1970-01-01T00:00:00.000Z') FROM account WHERE did=?", 1, a.did);
+	sqlite3_step(s);
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "did", a.did);
+	cJSON_AddStringToObject(o, "handle", a.handle);
+	if (*a.email) cJSON_AddStringToObject(o, "email", a.email);
+	cJSON_AddStringToObject(o, "indexedAt", (const char *)sqlite3_column_text(s, 0));
+	sqlite3_finalize(s);
+	return reply(c, 200, o);
+}
+
+/* ponytail: removes the account and its data here but leaves its PLC entry
+ * and old firehose events in place, as the reference PDS does. */
+static res admin_delete_account(struct MHD_Connection *c, cJSON *b) {
+	res e;
+	account a;
+	if (admin(c, &e)) return e;
+	const char *d = str(b, "did");
+	if (!d || strncmp(d, "did:", 4) || find_account(d, 0, &a))
+		return err(c, 400, "AccountNotFound", "account not found");
+	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+	int rc = exec1(q("DELETE FROM record WHERE did=?", 1, a.did)) || exec1(q("DELETE FROM blob WHERE did=?", 1, a.did)) ||
+	         exec1(q("DELETE FROM pref WHERE did=?", 1, a.did)) || exec1(q("DELETE FROM account WHERE did=?", 1, a.did)) ||
+	         account_event(a.did, "deleted");
+	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
+	broadcast();
+	return rc ? err(c, 500, "InternalServerError", "delete failed") : send_body(c, 200, "application/json", strdup("{}"));
+}
+
+/* Repo takedowns only: logins, tokens and public reads stop working. */
+static res admin_update_subject_status(struct MHD_Connection *c, cJSON *b) {
+	res e;
+	account a;
+	if (admin(c, &e)) return e;
+	cJSON *subj = cJSON_GetObjectItemCaseSensitive(b, "subject"), *td = cJSON_GetObjectItemCaseSensitive(b, "takedown");
+	const char *type = str(subj, "$type"), *d = str(subj, "did");
+	if (!type || strcmp(type, "com.atproto.admin.defs#repoRef") || !d)
+		return err(c, 400, "InvalidRequest", "only repoRef subjects are supported");
+	if (find_account(d, 0, &a) || strcmp(a.did, d)) return err(c, 400, "AccountNotFound", "account not found");
+	if (td) {
+		int on = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(td, "applied"));
+		const char *ref = str(td, "ref");
+		sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+		int rc = exec1(q("UPDATE account SET takedown=? WHERE did=?", 2, on ? (ref ? ref : "takendown") : NULL, a.did)) ||
+		         account_event(a.did, on ? "takendown" : NULL);
+		sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
+		broadcast();
+		if (rc) return err(c, 500, "InternalServerError", "update failed");
+	}
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddItemToObject(o, "subject", cJSON_Duplicate(subj, 1));
+	if (td) cJSON_AddItemToObject(o, "takedown", cJSON_Duplicate(td, 1));
+	return reply(c, 200, o);
+}
+
+static res admin_update_password(struct MHD_Connection *c, cJSON *b) {
+	res e;
+	account a;
+	if (admin(c, &e)) return e;
+	const char *d = str(b, "did"), *pw = str(b, "password");
+	if (!pw || !*pw) return err(c, 400, "InvalidRequest", "password is required");
+	if (!d || strncmp(d, "did:", 4) || find_account(d, 0, &a))
+		return err(c, 400, "AccountNotFound", "account not found");
+	unsigned char salt[16];
+	char salt_hex[33], hash[65];
+	RAND_bytes(salt, sizeof salt);
+	hex(salt, sizeof salt, salt_hex);
+	hash_pw(pw, salt_hex, hash);
+	return exec1(q("UPDATE account SET salt=?, hash=? WHERE did=?", 3, salt_hex, hash, a.did))
+	           ? err(c, 500, "InternalServerError", "update failed")
+	           : send_body(c, 200, "application/json", strdup("{}"));
 }
 
 static res create_invite_code(struct MHD_Connection *c, cJSON *b) {
-	if (admin(c)) return err(c, 401, "AuthenticationRequired", "admin auth required");
+	res e;
+	if (admin(c, &e)) return e;
 	cJSON *uc = cJSON_GetObjectItemCaseSensitive(b, "useCount");
 	const char *for_acct = str(b, "forAccount");
 	if (!cJSON_IsNumber(uc) || uc->valuedouble < 1 || uc->valuedouble > 100000 || uc->valuedouble != floor(uc->valuedouble))
@@ -1268,6 +1401,7 @@ static res create_session(struct MHD_Connection *c, cJSON *b) {
 	}
 	hash_pw(pw, a.salt, h);
 	if (CRYPTO_memcmp(h, a.hash, 64)) return err(c, 401, "AuthenticationRequired", "Invalid identifier or password");
+	if (a.takedown) return err(c, 401, "AccountTakedown", "account has been taken down");
 	return session(c, &a);
 }
 
@@ -1399,7 +1533,7 @@ static res update_handle(struct MHD_Connection *c, cJSON *b) {
 	snprintf(plc, sizeof plc, "%s/%s", plc_url ? plc_url : "", did);
 	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
 	int rc = !op || exec1(q("UPDATE account SET handle=?, plc_op=? WHERE did=?", 3, handle, op, did)) ||
-	         account_events(did, handle, 0) || (plc_url && post_json(plc, op));
+	         identity_event(did, handle) || (plc_url && post_json(plc, op));
 	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
 	free(op);
 	broadcast();
@@ -1435,7 +1569,8 @@ static res service_did_doc(struct MHD_Connection *c) {
 static res describe_repo(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
 	account a;
-	if (find_account(ARG("repo"), 0, &a)) return err(c, 400, "RepoNotFound", "could not find repo");
+	res e;
+	if (find_repo(c, ARG("repo"), 0, &a, &e)) return e;
 	cJSON *o = cJSON_CreateObject(), *cols = cJSON_CreateArray();
 	cJSON_AddStringToObject(o, "handle", a.handle);
 	cJSON_AddStringToObject(o, "did", a.did);
@@ -1464,7 +1599,8 @@ static res get_record(struct MHD_Connection *c, cJSON *b) {
 	account a;
 	const char *col = ARG("collection"), *rkey = ARG("rkey");
 	if (!col || !rkey) return err(c, 400, "InvalidRequest", "collection and rkey are required");
-	if (find_account(ARG("repo"), 0, &a)) return err(c, 400, "RepoNotFound", "could not find repo");
+	res e;
+	if (find_repo(c, ARG("repo"), 0, &a, &e)) return e;
 	sqlite3_stmt *s = q("SELECT cid,value FROM record WHERE did=? AND collection=? AND rkey=?", 3, a.did, col, rkey);
 	res r = sqlite3_step(s) == SQLITE_ROW
 	            ? reply(c, 200, record_view(a.did, col, rkey, (const char *)sqlite3_column_text(s, 0),
@@ -1479,7 +1615,8 @@ static res list_records(struct MHD_Connection *c, cJSON *b) {
 	account a;
 	const char *col = ARG("collection"), *cursor = ARG("cursor"), *rev = ARG("reverse"), *lim = ARG("limit");
 	if (!col) return err(c, 400, "InvalidRequest", "collection is required");
-	if (find_account(ARG("repo"), 0, &a)) return err(c, 400, "RepoNotFound", "could not find repo");
+	res e;
+	if (find_repo(c, ARG("repo"), 0, &a, &e)) return e;
 	int limit = lim ? atoi(lim) : 50;
 	if (limit < 1 || limit > 100) return err(c, 400, "InvalidRequest", "limit must be 1-100");
 	char limstr[8], last[520] = "";
@@ -1675,15 +1812,11 @@ static res apply_writes(struct MHD_Connection *c, cJSON *b) {
 
 /* ---------- sync ---------- */
 
-static int did_arg(struct MHD_Connection *c, account *a) {
-	const char *d = ARG("did");
-	return d && !strncmp(d, "did:", 4) && !find_account(d, 0, a) ? 0 : -1;
-}
-
 static res get_latest_commit(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
 	account a;
-	if (did_arg(c, &a)) return err(c, 400, "RepoNotFound", "could not find repo for DID");
+	res e;
+	if (find_repo(c, ARG("did"), 1, &a, &e)) return e;
 	cJSON *o = cJSON_CreateObject();
 	cJSON_AddStringToObject(o, "cid", a.head);
 	cJSON_AddStringToObject(o, "rev", a.rev);
@@ -1693,10 +1826,12 @@ static res get_latest_commit(struct MHD_Connection *c, cJSON *b) {
 static res get_repo_status(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
 	account a;
-	if (did_arg(c, &a)) return err(c, 400, "RepoNotFound", "could not find repo for DID");
+	const char *d = ARG("did");
+	if (!d || strncmp(d, "did:", 4) || find_account(d, 0, &a)) return err(c, 400, "RepoNotFound", "could not find repo");
 	cJSON *o = cJSON_CreateObject();
 	cJSON_AddStringToObject(o, "did", a.did);
-	cJSON_AddBoolToObject(o, "active", 1);
+	cJSON_AddBoolToObject(o, "active", !a.takedown);
+	if (a.takedown) cJSON_AddStringToObject(o, "status", "takendown");
 	cJSON_AddStringToObject(o, "rev", a.rev);
 	return reply(c, 200, o);
 }
@@ -1708,7 +1843,7 @@ static res list_repos(struct MHD_Connection *c, cJSON *b) {
 	if (limit < 1 || limit > 1000) return err(c, 400, "InvalidRequest", "limit must be 1-1000");
 	char limstr[8], last[64] = "";
 	snprintf(limstr, sizeof limstr, "%d", limit);
-	sqlite3_stmt *s = q("SELECT did,head,rev FROM account WHERE ?1 IS NULL OR did>?1 ORDER BY did "
+	sqlite3_stmt *s = q("SELECT did,head,rev,takedown IS NOT NULL FROM account WHERE ?1 IS NULL OR did>?1 ORDER BY did "
 	                    "LIMIT CAST(?2 AS INTEGER)",
 	                    2, ARG("cursor"), limstr);
 	cJSON *o = cJSON_CreateObject(), *arr = cJSON_AddArrayToObject(o, "repos");
@@ -1719,7 +1854,8 @@ static res list_repos(struct MHD_Connection *c, cJSON *b) {
 		cJSON_AddStringToObject(r, "did", last);
 		cJSON_AddStringToObject(r, "head", (const char *)sqlite3_column_text(s, 1));
 		cJSON_AddStringToObject(r, "rev", (const char *)sqlite3_column_text(s, 2));
-		cJSON_AddBoolToObject(r, "active", 1);
+		cJSON_AddBoolToObject(r, "active", !sqlite3_column_int(s, 3));
+		if (sqlite3_column_int(s, 3)) cJSON_AddStringToObject(r, "status", "takendown");
 		cJSON_AddItemToArray(arr, r);
 	}
 	sqlite3_finalize(s);
@@ -1732,7 +1868,8 @@ static res list_repos(struct MHD_Connection *c, cJSON *b) {
 static res get_repo(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
 	account a;
-	if (did_arg(c, &a)) return err(c, 400, "RepoNotFound", "could not find repo for DID");
+	res e;
+	if (find_repo(c, ARG("did"), 1, &a, &e)) return e;
 	buf car = {0}, blk = {0};
 	unsigned char cid[36];
 	sqlite3_stmt *s = q("SELECT head_block FROM account WHERE did=?", 1, a.did);
@@ -1760,7 +1897,8 @@ static res get_repo(struct MHD_Connection *c, cJSON *b) {
 static res get_blob(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
 	account a;
-	if (did_arg(c, &a)) return err(c, 400, "RepoNotFound", "could not find repo for DID");
+	res e;
+	if (find_repo(c, ARG("did"), 1, &a, &e)) return e;
 	sqlite3_stmt *s = q("SELECT mime, data FROM blob WHERE did=? AND cid=?", 2, a.did, ARG("cid"));
 	res r;
 	if (sqlite3_step(s) == SQLITE_ROW) {
@@ -1778,7 +1916,8 @@ static res get_blob(struct MHD_Connection *c, cJSON *b) {
 static res list_blobs(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
 	account a;
-	if (did_arg(c, &a)) return err(c, 400, "RepoNotFound", "could not find repo for DID");
+	res e;
+	if (find_repo(c, ARG("did"), 1, &a, &e)) return e;
 	const char *lim = ARG("limit");
 	int limit = lim ? atoi(lim) : 500;
 	if (limit < 1 || limit > 1000) return err(c, 400, "InvalidRequest", "limit must be 1-1000");
@@ -1829,6 +1968,10 @@ static const struct {
     {"/xrpc/com.atproto.server.describeServer", 0, describe_server},
     {"/xrpc/com.atproto.server.createAccount", 1, create_account},
     {"/xrpc/com.atproto.server.createInviteCode", 1, create_invite_code},
+    {"/xrpc/com.atproto.admin.getAccountInfo", 0, admin_get_account_info},
+    {"/xrpc/com.atproto.admin.deleteAccount", 1, admin_delete_account},
+    {"/xrpc/com.atproto.admin.updateSubjectStatus", 1, admin_update_subject_status},
+    {"/xrpc/com.atproto.admin.updateAccountPassword", 1, admin_update_password},
     {"/xrpc/com.atproto.server.createSession", 1, create_session},
     {"/xrpc/com.atproto.server.getSession", 0, get_session},
     {"/xrpc/com.atproto.server.refreshSession", 1, refresh_session},
@@ -1994,7 +2137,7 @@ int main(void) {
 	snprintf(service_did, sizeof service_did, "did:web:%s", hostname);
 	int local = !strcmp(hostname, "localhost");
 	plc_url = env("PDS_PLC_URL", local ? NULL : "https://plc.directory");
-	crawler = env("PDS_CRAWLER", local ? NULL : "https://bsky.network");
+	crawlers = env("PDS_CRAWLERS", local ? NULL : "https://bsky.network");
 	appview_url = env("PDS_APPVIEW_URL", "https://api.bsky.app");
 	appview_did = env("PDS_APPVIEW_DID", "did:web:api.bsky.app");
 	curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -2008,7 +2151,7 @@ int main(void) {
 	                 "PRAGMA journal_mode=WAL;"
 	                 "CREATE TABLE IF NOT EXISTS account(did TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL,"
 	                 " email TEXT UNIQUE, salt TEXT NOT NULL, hash TEXT NOT NULL, key TEXT NOT NULL,"
-	                 " pubkey TEXT NOT NULL, head TEXT, rev TEXT, head_block BLOB, plc_op TEXT);"
+	                 " pubkey TEXT NOT NULL, head TEXT, rev TEXT, head_block BLOB, plc_op TEXT, created_at TEXT, takedown TEXT);"
 	                 "CREATE TABLE IF NOT EXISTS record(did TEXT NOT NULL, collection TEXT NOT NULL,"
 	                 " rkey TEXT NOT NULL, cid TEXT NOT NULL, value TEXT NOT NULL,"
 	                 " PRIMARY KEY(did, collection, rkey));"
@@ -2023,6 +2166,9 @@ int main(void) {
 		fprintf(stderr, "db: %s\n", sqlite3_errmsg(db));
 		return 1;
 	}
+	/* columns added after the first schema; fails harmlessly once present */
+	sqlite3_exec(db, "ALTER TABLE account ADD COLUMN created_at TEXT", NULL, NULL, NULL);
+	sqlite3_exec(db, "ALTER TABLE account ADD COLUMN takedown TEXT", NULL, NULL, NULL);
 	sqlite3_stmt *s = q("SELECT ifnull(max(seq), 0) FROM event", 0);
 	sqlite3_step(s);
 	sent_seq = sqlite3_column_int64(s, 0);
@@ -2037,8 +2183,8 @@ int main(void) {
 		fprintf(stderr, "cannot listen on port %d\n", port);
 		return 1;
 	}
-	fprintf(stderr, "PDS %s listening on :%d (plc: %s, crawler: %s)\n", hostname, port, plc_url ? plc_url : "off",
-	        crawler ? crawler : "off");
+	fprintf(stderr, "PDS %s listening on :%d (plc: %s, crawlers: %s)\n", hostname, port, plc_url ? plc_url : "off",
+	        crawlers ? crawlers : "off");
 	request_crawl();
 	for (;;) pause();
 }
