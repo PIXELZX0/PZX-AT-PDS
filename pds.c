@@ -41,12 +41,13 @@
 static sqlite3 *db;
 static const char *hostname, *plc_url, *crawlers; /* NULL: stay local */
 static const char *appview_url, *appview_did;
+static const char *smtp_url, *mail_from; /* smtp_url NULL: mails are logged to stderr */
 /* ponytail: one recursive lock serializes all state (sqlite, subscribers,
  * caches); only proxied calls run outside it. Finer locks if contention shows. */
 static pthread_mutex_t big;
 static char endpoint[300], service_did[300];
 static unsigned char jwt_secret[32];
-static int invite_required, trust_proxy;
+static int invite_required, trust_proxy, require_email_confirmed;
 static char admin_basic[400]; /* expected "Basic <base64(admin:password)>", empty: admin disabled */
 
 /* ---------- encoding helpers ---------- */
@@ -369,15 +370,15 @@ static int exec1(sqlite3_stmt *s) {
 
 typedef struct {
 	char did[64], handle[256], email[256], salt[33], hash[65], pubkey[64], head[64], rev[16];
-	int takedown;
+	int takedown, email_confirmed;
 } account;
 
 /* ident may be a DID or handle; with_email also matches email. */
 static int find_account(const char *ident, int with_email, account *a) {
 	if (!ident) return -1;
-	sqlite3_stmt *s = q(with_email ? "SELECT did,handle,ifnull(email,''),salt,hash,pubkey,ifnull(head,''),ifnull(rev,''),takedown IS NOT NULL FROM account "
+	sqlite3_stmt *s = q(with_email ? "SELECT did,handle,ifnull(email,''),salt,hash,pubkey,ifnull(head,''),ifnull(rev,''),takedown IS NOT NULL,email_confirmed_at IS NOT NULL FROM account "
 	                                 "WHERE did=?1 OR handle=lower(?1) OR lower(email)=lower(?1)"
-	                               : "SELECT did,handle,ifnull(email,''),salt,hash,pubkey,ifnull(head,''),ifnull(rev,''),takedown IS NOT NULL FROM account "
+	                               : "SELECT did,handle,ifnull(email,''),salt,hash,pubkey,ifnull(head,''),ifnull(rev,''),takedown IS NOT NULL,email_confirmed_at IS NOT NULL FROM account "
 	                                 "WHERE did=?1 OR handle=lower(?1)",
 	                    1, ident);
 	int found = sqlite3_step(s) == SQLITE_ROW;
@@ -391,6 +392,7 @@ static int find_account(const char *ident, int with_email, account *a) {
 		snprintf(a->head, sizeof a->head, "%s", sqlite3_column_text(s, 6));
 		snprintf(a->rev, sizeof a->rev, "%s", sqlite3_column_text(s, 7));
 		a->takedown = sqlite3_column_int(s, 8);
+		a->email_confirmed = sqlite3_column_int(s, 9);
 	}
 	sqlite3_finalize(s);
 	return found ? 0 : -1;
@@ -401,6 +403,15 @@ static void hash_pw(const char *pw, const char *salt, char out[65]) {
 	PKCS5_PBKDF2_HMAC(pw, (int)strlen(pw), (const unsigned char *)salt, (int)strlen(salt), 100000, EVP_sha256(),
 	                  sizeof h, h);
 	hex(h, sizeof h, out);
+}
+
+static int set_password(const char *did, const char *pw) {
+	unsigned char salt[16];
+	char salt_hex[33], hash[65];
+	RAND_bytes(salt, sizeof salt);
+	hex(salt, sizeof salt, salt_hex);
+	hash_pw(pw, salt_hex, hash);
+	return exec1(q("UPDATE account SET salt=?, hash=? WHERE did=?", 3, salt_hex, hash, did));
 }
 
 /* ---------- repo: MST + signed commits ---------- */
@@ -962,6 +973,7 @@ static res session(struct MHD_Connection *c, const account *a) {
 	cJSON_AddStringToObject(o, "handle", a->handle);
 	cJSON_AddStringToObject(o, "did", a->did);
 	if (*a->email) cJSON_AddStringToObject(o, "email", a->email);
+	cJSON_AddBoolToObject(o, "emailConfirmed", a->email_confirmed);
 	cJSON_AddItemToObject(o, "didDoc", did_doc(a));
 	cJSON_AddBoolToObject(o, "active", 1);
 	return reply(c, 200, o);
@@ -1182,6 +1194,17 @@ static void client_ip(struct MHD_Connection *c, char out[64]) {
 	if (sa && sa->sa_family == AF_INET6) inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)sa)->sin6_addr, out, 64);
 }
 
+/* Also keeps CR/LF and friends out of the mail headers built from it. */
+static int valid_email(const char *e) {
+	const char *at = strchr(e, '@');
+	return strlen(e) <= 254 && at && at > e && at[1] && !strchr(at + 1, '@') && !strpbrk(e, "\r\n <>,;\"()\\");
+}
+
+/* With PDS_REQUIRE_EMAIL_CONFIRMED, repo writes and blob uploads need a confirmed email. */
+static res not_confirmed(struct MHD_Connection *c) {
+	return err(c, 403, "EmailNotConfirmed", "confirm your email address first");
+}
+
 static res too_many(struct MHD_Connection *c) {
 	return err(c, 429, "RateLimitExceeded", "too many attempts, try again later");
 }
@@ -1225,8 +1248,7 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 	if (strlen(h) >= sizeof handle) return err(c, 400, "InvalidHandle", "handle too long");
 	for (size_t i = 0; (handle[i] = (char)tolower((unsigned char)h[i])); i++);
 	if (!valid_handle(handle)) return err(c, 400, "InvalidHandle", "handle must be <name>.<hostname>");
-	if (email && (strlen(email) > 254 || !strchr(email, '@')))
-		return err(c, 400, "InvalidRequest", "invalid email");
+	if (email && !valid_email(email)) return err(c, 400, "InvalidRequest", "invalid email");
 	account a;
 	if (!find_account(handle, 0, &a)) return err(c, 400, "HandleNotAvailable", "handle already taken");
 	if (email && !find_account(email, 1, &a)) return err(c, 400, "InvalidRequest", "email already taken");
@@ -1315,7 +1337,8 @@ static res admin_delete_account(struct MHD_Connection *c, cJSON *b) {
 		return err(c, 400, "AccountNotFound", "account not found");
 	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
 	int rc = exec1(q("DELETE FROM record WHERE did=?", 1, a.did)) || exec1(q("DELETE FROM blob WHERE did=?", 1, a.did)) ||
-	         exec1(q("DELETE FROM pref WHERE did=?", 1, a.did)) || exec1(q("DELETE FROM account WHERE did=?", 1, a.did)) ||
+	         exec1(q("DELETE FROM pref WHERE did=?", 1, a.did)) || exec1(q("DELETE FROM email_token WHERE did=?", 1, a.did)) ||
+	         exec1(q("DELETE FROM account WHERE did=?", 1, a.did)) ||
 	         account_event(a.did, "deleted");
 	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
 	broadcast();
@@ -1356,12 +1379,7 @@ static res admin_update_password(struct MHD_Connection *c, cJSON *b) {
 	if (!pw || !*pw) return err(c, 400, "InvalidRequest", "password is required");
 	if (!d || strncmp(d, "did:", 4) || find_account(d, 0, &a))
 		return err(c, 400, "AccountNotFound", "account not found");
-	unsigned char salt[16];
-	char salt_hex[33], hash[65];
-	RAND_bytes(salt, sizeof salt);
-	hex(salt, sizeof salt, salt_hex);
-	hash_pw(pw, salt_hex, hash);
-	return exec1(q("UPDATE account SET salt=?, hash=? WHERE did=?", 3, salt_hex, hash, a.did))
+	return set_password(a.did, pw)
 	           ? err(c, 500, "InternalServerError", "update failed")
 	           : send_body(c, 200, "application/json", strdup("{}"));
 }
@@ -1380,12 +1398,47 @@ static res create_invite_code(struct MHD_Connection *c, cJSON *b) {
 	snprintf(code, sizeof code, "%s-%.5s-%.5s-%.6s", hostname, tail, tail + 5, tail + 10);
 	for (char *p = code; *p; p++) *p = *p == '.' ? '-' : *p;
 	snprintf(uses, sizeof uses, "%d", (int)uc->valuedouble);
-	if (exec1(q("INSERT INTO invite(code, uses_left, for_account) VALUES(?, CAST(? AS INTEGER), ?)", 3, code, uses,
-	            for_acct ? for_acct : "admin")))
+	char now[32];
+	now_iso(now);
+	if (exec1(q("INSERT INTO invite(code, uses_left, for_account, created_at) VALUES(?, CAST(? AS INTEGER), ?, ?)", 4,
+	            code, uses, for_acct ? for_acct : "admin", now)))
 		return err(c, 500, "InternalServerError", "could not create invite code");
 	cJSON *o = cJSON_CreateObject();
 	cJSON_AddStringToObject(o, "code", code);
 	return reply(c, 200, o);
+}
+
+/* Newest first. ponytail: no cursor, capped at 500; page if invites pile up. */
+static res admin_get_invite_codes(struct MHD_Connection *c, cJSON *b) {
+	(void)b;
+	res e;
+	if (admin(c, &e)) return e;
+	sqlite3_stmt *s = q("SELECT code, uses_left, for_account, ifnull(created_at, '1970-01-01T00:00:00.000Z')"
+	                    " FROM invite ORDER BY rowid DESC LIMIT 500", 0);
+	cJSON *o = cJSON_CreateObject(), *arr = cJSON_AddArrayToObject(o, "codes");
+	while (sqlite3_step(s) == SQLITE_ROW) {
+		cJSON *r = cJSON_CreateObject();
+		cJSON_AddStringToObject(r, "code", (const char *)sqlite3_column_text(s, 0));
+		cJSON_AddNumberToObject(r, "available", sqlite3_column_int(s, 1));
+		cJSON_AddBoolToObject(r, "disabled", 0);
+		cJSON_AddStringToObject(r, "forAccount", (const char *)sqlite3_column_text(s, 2));
+		cJSON_AddStringToObject(r, "createdBy", "admin");
+		cJSON_AddStringToObject(r, "createdAt", (const char *)sqlite3_column_text(s, 3));
+		cJSON_AddArrayToObject(r, "uses");
+		cJSON_AddItemToArray(arr, r);
+	}
+	sqlite3_finalize(s);
+	return reply(c, 200, o);
+}
+
+/* ponytail: disabling just uses the code up; no separate disabled flag. */
+static res admin_disable_invite_codes(struct MHD_Connection *c, cJSON *b) {
+	res e;
+	if (admin(c, &e)) return e;
+	cJSON *codes = cJSON_GetObjectItemCaseSensitive(b, "codes"), *it;
+	if (!cJSON_IsArray(codes)) return err(c, 400, "InvalidRequest", "codes must be an array");
+	cJSON_ArrayForEach(it, codes) if (cJSON_IsString(it)) exec1(q("UPDATE invite SET uses_left=0 WHERE code=?", 1, it->valuestring));
+	return send_body(c, 200, "application/json", strdup("{}"));
 }
 
 static res create_session(struct MHD_Connection *c, cJSON *b) {
@@ -1415,6 +1468,7 @@ static res get_session(struct MHD_Connection *c, cJSON *b) {
 	cJSON_AddStringToObject(o, "handle", a.handle);
 	cJSON_AddStringToObject(o, "did", a.did);
 	if (*a.email) cJSON_AddStringToObject(o, "email", a.email);
+	cJSON_AddBoolToObject(o, "emailConfirmed", a.email_confirmed);
 	cJSON_AddItemToObject(o, "didDoc", did_doc(&a));
 	cJSON_AddBoolToObject(o, "active", 1);
 	return reply(c, 200, o);
@@ -1434,6 +1488,211 @@ static res refresh_session(struct MHD_Connection *c, cJSON *b) {
 static res delete_session(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
 	return send_body(c, 200, "application/json", strdup("{}"));
+}
+
+/* ---------- email confirmation / update ---------- */
+
+#define EMAIL_TOKEN_TTL (15 * 60)
+
+typedef struct { char to[256], msg[2048]; const char *p; size_t left; } mail_job;
+
+static size_t mail_read(char *dst, size_t size, size_t n, void *cls) {
+	mail_job *m = cls;
+	size_t k = size * n < m->left ? size * n : m->left;
+	memcpy(dst, m->p, k);
+	m->p += k, m->left -= k;
+	return k;
+}
+
+static void *mail_thread(void *arg) {
+	mail_job *m = arg;
+	char from[300];
+	snprintf(from, sizeof from, "%s", mail_from);
+	char *lt = strrchr(from, '<'); /* "Name <addr>" → envelope "<addr>" */
+	struct curl_slist *rcpt = curl_slist_append(NULL, m->to);
+	CURL *c = curl_easy_init();
+	curl_easy_setopt(c, CURLOPT_URL, smtp_url);
+	curl_easy_setopt(c, CURLOPT_USE_SSL, (long)CURLUSESSL_ALL);
+	curl_easy_setopt(c, CURLOPT_MAIL_FROM, lt ? lt : from);
+	curl_easy_setopt(c, CURLOPT_MAIL_RCPT, rcpt);
+	curl_easy_setopt(c, CURLOPT_READFUNCTION, mail_read);
+	curl_easy_setopt(c, CURLOPT_READDATA, m);
+	curl_easy_setopt(c, CURLOPT_UPLOAD, 1L);
+	curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+	CURLcode rc = curl_easy_perform(c);
+	if (rc != CURLE_OK) fprintf(stderr, "mail to %s failed: %s\n", m->to, curl_easy_strerror(rc));
+	curl_easy_cleanup(c);
+	curl_slist_free_all(rcpt);
+	free(m);
+	return NULL;
+}
+
+/* Sends over PDS_EMAIL_SMTP_URL (smtp:// or smtps://user:pass@host:port), or
+ * just logs the mail when that's unset. `to` must have passed valid_email.
+ * Delivery runs on its own thread, so the reply never waits on SMTP and takes
+ * as long whether or not a mail went out (requestPasswordReset relies on that);
+ * delivery failures are only logged. */
+static int send_mail(const char *to, const char *subject, const char *text) {
+	if (!smtp_url) return fprintf(stderr, "mail to %s: %s\n%s\n", to, subject, text), 0;
+	mail_job *m = malloc(sizeof *m);
+	char date[64];
+	time_t t = time(NULL);
+	struct tm tm;
+	gmtime_r(&t, &tm);
+	strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S +0000", &tm);
+	int n = snprintf(m->msg, sizeof m->msg,
+	                 "Date: %s\r\nFrom: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\n"
+	                 "Content-Type: text/plain; charset=utf-8\r\n\r\n%s\r\n",
+	                 date, mail_from, to, subject, text);
+	pthread_t th;
+	pthread_attr_t at;
+	pthread_attr_init(&at);
+	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+	snprintf(m->to, sizeof m->to, "%s", to);
+	m->p = m->msg, m->left = (size_t)n;
+	int rc = n < (int)sizeof m->msg && !pthread_create(&th, &at, mail_thread, m) ? 0 : -1;
+	pthread_attr_destroy(&at);
+	if (rc) free(m);
+	return rc;
+}
+
+/* New single-use token for did+purpose, replacing any older one: "ABCDE-FGHIJ". */
+static int new_email_token(const char *did, const char *purpose, char tok[12]) {
+	unsigned char rnd[7];
+	char b[16], when[24];
+	RAND_bytes(rnd, sizeof rnd);
+	b32(rnd, sizeof rnd, b); /* 50 of its bits are used */
+	snprintf(tok, 12, "%.5s-%.5s", b, b + 5);
+	for (char *p = tok; *p; p++) *p = (char)toupper((unsigned char)*p);
+	snprintf(when, sizeof when, "%ld", (long)time(NULL));
+	return exec1(q("INSERT OR REPLACE INTO email_token(did,purpose,token,requested_at) VALUES(?,?,?,CAST(? AS INTEGER))",
+	               4, did, purpose, tok, when));
+}
+
+/* 0 and the token is consumed; otherwise queues InvalidToken/ExpiredToken into *e.
+ * An empty did is looked up by the token and filled in. */
+static int use_email_token(struct MHD_Connection *c, char did[64], const char *purpose, const char *tok, res *e) {
+	char want[12] = "", got[12] = "";
+	long at = 0;
+	for (size_t i = 0; tok && tok[i] && i < sizeof got - 1; i++) got[i] = (char)toupper((unsigned char)tok[i]);
+	sqlite3_stmt *s = *did ? q("SELECT token, requested_at, did FROM email_token WHERE did=? AND purpose=?", 2, did, purpose)
+	                       : q("SELECT token, requested_at, did FROM email_token WHERE token=? AND purpose=?", 2, got, purpose);
+	if (sqlite3_step(s) == SQLITE_ROW) {
+		snprintf(want, sizeof want, "%s", sqlite3_column_text(s, 0)), at = (long)sqlite3_column_int64(s, 1);
+		snprintf(did, 64, "%s", sqlite3_column_text(s, 2));
+	}
+	sqlite3_finalize(s);
+	if (!*want || !tok || strlen(tok) != 11 || CRYPTO_memcmp(want, got, 11))
+		return *e = err(c, 400, "InvalidToken", "token is invalid"), -1;
+	if (time(NULL) - at > EMAIL_TOKEN_TTL) return *e = err(c, 400, "ExpiredToken", "token has expired"), -1;
+	exec1(q("DELETE FROM email_token WHERE did=? AND purpose=?", 2, did, purpose));
+	return 0;
+}
+
+/* Authenticated account, or queues an error into *e. */
+static int auth_account(struct MHD_Connection *c, account *a, res *e) {
+	char did[64];
+	if (auth(c, "com.atproto.access", did) || find_account(did, 0, a))
+		return *e = err(c, 401, "AuthenticationRequired", "invalid or expired token"), -1;
+	return 0;
+}
+
+/* Mails a fresh token: 0 sent, -1 failed, -2 over 5 mails per account per hour
+ * (so we can't be used to spam someone). */
+static int send_token(const account *a, const char *purpose, const char *subject, const char *what) {
+	char tok[12], text[512];
+	if (rate_limited("email", a->did, 5, 3600)) return -2;
+	if (new_email_token(a->did, purpose, tok)) return -1;
+	snprintf(text, sizeof text, "Your code to %s on %s is:\r\n\r\n    %s\r\n\r\nIt expires in 15 minutes. "
+	         "If you didn't ask for this, ignore this mail.", what, hostname, tok);
+	return send_mail(a->email, subject, text);
+}
+
+/* Replies ok, or the error send_token hit. */
+static res mail_token(struct MHD_Connection *c, const account *a, const char *purpose, const char *subject,
+                      const char *what, cJSON *ok) {
+	int rc = send_token(a, purpose, subject, what);
+	if (!rc) return reply(c, 200, ok);
+	cJSON_Delete(ok);
+	return rc == -2 ? too_many(c) : err(c, 500, "InternalServerError", "could not send email");
+}
+
+static res request_email_confirmation(struct MHD_Connection *c, cJSON *b) {
+	(void)b;
+	account a;
+	res e;
+	if (auth_account(c, &a, &e)) return e;
+	if (!*a.email) return err(c, 400, "InvalidRequest", "account has no email address");
+	return mail_token(c, &a, "confirm_email", "Confirm your email", "confirm this email address", cJSON_CreateObject());
+}
+
+static res confirm_email(struct MHD_Connection *c, cJSON *b) {
+	account a;
+	res e;
+	char now[32];
+	if (auth_account(c, &a, &e)) return e;
+	const char *email = str(b, "email");
+	if (!email || !*a.email || strcasecmp(email, a.email)) return err(c, 400, "InvalidEmail", "email does not match");
+	if (use_email_token(c, a.did, "confirm_email", str(b, "token"), &e)) return e;
+	now_iso(now);
+	return exec1(q("UPDATE account SET email_confirmed_at=? WHERE did=?", 2, now, a.did))
+	           ? err(c, 500, "InternalServerError", "update failed")
+	           : send_body(c, 200, "application/json", strdup("{}"));
+}
+
+/* A confirmed address can only be changed with a token mailed to it. */
+static res request_email_update(struct MHD_Connection *c, cJSON *b) {
+	(void)b;
+	account a;
+	res e;
+	if (auth_account(c, &a, &e)) return e;
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddBoolToObject(o, "tokenRequired", a.email_confirmed);
+	if (!a.email_confirmed) return reply(c, 200, o);
+	return mail_token(c, &a, "update_email", "Change your email", "change your email address", o);
+}
+
+static res update_email(struct MHD_Connection *c, cJSON *b) {
+	account a, other;
+	res e;
+	if (auth_account(c, &a, &e)) return e;
+	const char *email = str(b, "email");
+	if (!email || !valid_email(email)) return err(c, 400, "InvalidRequest", "invalid email");
+	if (!find_account(email, 1, &other) && strcmp(other.did, a.did))
+		return err(c, 400, "InvalidRequest", "email already taken");
+	if (a.email_confirmed) {
+		if (!str(b, "token")) return err(c, 400, "TokenRequired", "confirmation token required");
+		if (use_email_token(c, a.did, "update_email", str(b, "token"), &e)) return e;
+	}
+	if (!strcasecmp(email, a.email)) return send_body(c, 200, "application/json", strdup("{}"));
+	return exec1(q("UPDATE account SET email=?, email_confirmed_at=NULL WHERE did=?", 2, email, a.did))
+	           ? err(c, 500, "InternalServerError", "update failed")
+	           : send_body(c, 200, "application/json", strdup("{}"));
+}
+
+/* Always answers {} so it can't be used to find out which emails have accounts. */
+static res request_password_reset(struct MHD_Connection *c, cJSON *b) {
+	account a;
+	char ip[64];
+	client_ip(c, ip);
+	if (rate_limited("reset-ip", ip, 10, 3600)) return too_many(c);
+	const char *email = str(b, "email");
+	if (email && valid_email(email) && !find_account(email, 1, &a) && !strcasecmp(email, a.email) && !a.takedown)
+		send_token(&a, "reset_password", "Reset your password", "reset your password");
+	return send_body(c, 200, "application/json", strdup("{}"));
+}
+
+/* Unauthenticated: the token alone picks the account, so guesses are capped per IP. */
+static res reset_password(struct MHD_Connection *c, cJSON *b) {
+	char ip[64], did[64] = "";
+	res e;
+	client_ip(c, ip);
+	if (rate_limited("reset-try-ip", ip, 20, 300)) return too_many(c);
+	const char *pw = str(b, "password");
+	if (!pw || !*pw) return err(c, 400, "InvalidRequest", "password is required");
+	if (use_email_token(c, did, "reset_password", str(b, "token"), &e)) return e;
+	return set_password(did, pw) ? err(c, 500, "InternalServerError", "update failed")
+	                             : send_body(c, 200, "application/json", strdup("{}"));
 }
 
 static res resolve_handle(struct MHD_Connection *c, cJSON *b) {
@@ -1734,6 +1993,7 @@ static res writer(struct MHD_Connection *c, const cJSON *b, account *a) {
 	if (auth(c, "com.atproto.access", did)) return err(c, 401, "AuthenticationRequired", "invalid or expired token");
 	if (find_account(str(b, "repo"), 0, a) || strcmp(a->did, did))
 		return err(c, 403, "Forbidden", "can only write to your own repo");
+	if (require_email_confirmed && !a->email_confirmed) return not_confirmed(c);
 	const char *swap = str(b, "swapCommit");
 	if (swap && strcmp(swap, a->head)) return err(c, 400, "InvalidSwap", "repo head has moved");
 	return 0;
@@ -1972,10 +2232,18 @@ static const struct {
     {"/xrpc/com.atproto.admin.deleteAccount", 1, admin_delete_account},
     {"/xrpc/com.atproto.admin.updateSubjectStatus", 1, admin_update_subject_status},
     {"/xrpc/com.atproto.admin.updateAccountPassword", 1, admin_update_password},
+    {"/xrpc/com.atproto.admin.getInviteCodes", 0, admin_get_invite_codes},
+    {"/xrpc/com.atproto.admin.disableInviteCodes", 1, admin_disable_invite_codes},
     {"/xrpc/com.atproto.server.createSession", 1, create_session},
     {"/xrpc/com.atproto.server.getSession", 0, get_session},
     {"/xrpc/com.atproto.server.refreshSession", 1, refresh_session},
     {"/xrpc/com.atproto.server.deleteSession", 1, delete_session},
+    {"/xrpc/com.atproto.server.requestEmailConfirmation", 1, request_email_confirmation},
+    {"/xrpc/com.atproto.server.confirmEmail", 1, confirm_email},
+    {"/xrpc/com.atproto.server.requestEmailUpdate", 1, request_email_update},
+    {"/xrpc/com.atproto.server.updateEmail", 1, update_email},
+    {"/xrpc/com.atproto.server.requestPasswordReset", 1, request_password_reset},
+    {"/xrpc/com.atproto.server.resetPassword", 1, reset_password},
     {"/xrpc/com.atproto.identity.resolveHandle", 0, resolve_handle},
     {"/xrpc/com.atproto.identity.updateHandle", 1, update_handle},
     {"/xrpc/com.atproto.repo.describeRepo", 0, describe_repo},
@@ -2015,7 +2283,10 @@ static res well_known_did(struct MHD_Connection *c) {
  * of unreferenced blobs if storage matters. */
 static res upload_blob(struct MHD_Connection *c, const body *bd) {
 	char did[64], cs[64], size[24];
-	if (auth(c, "com.atproto.access", did)) return err(c, 401, "AuthenticationRequired", "invalid or expired token");
+	account a;
+	if (auth(c, "com.atproto.access", did) || find_account(did, 0, &a))
+		return err(c, 401, "AuthenticationRequired", "invalid or expired token");
+	if (require_email_confirmed && !a.email_confirmed) return not_confirmed(c);
 	if (bd->too_big) return err(c, 413, "BlobTooLarge", "blob exceeds 5MB");
 	const char *mime = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Content-Type");
 	if (!mime || !*mime || strlen(mime) > 128 || strpbrk(mime, "\r\n")) mime = "application/octet-stream";
@@ -2071,7 +2342,34 @@ static res handler(void *cls, struct MHD_Connection *c, const char *url, const c
 	return r;
 }
 
+static const char *env(const char *k, const char *def) {
+	const char *v = getenv(k);
+	return v && *v ? v : def;
+}
+
+/* Web admin panel: a static page (PDS_ADMIN_HTML, default ./admin.html) that
+ * calls the admin XRPC routes itself; read per request so edits show live. */
+static res admin_page(struct MHD_Connection *c) {
+	FILE *f = fopen(env("PDS_ADMIN_HTML", "admin.html"), "rb");
+	if (!f) return send_body(c, 404, "text/plain", strdup("admin panel not installed"));
+	buf b = {0};
+	char chunk[8192];
+	for (size_t n; (n = fread(chunk, 1, sizeof chunk, f));) put(&b, chunk, n);
+	fclose(f);
+	struct MHD_Response *r = MHD_create_response_from_buffer(b.n, b.p ? (void *)b.p : malloc(1), MHD_RESPMEM_MUST_FREE);
+	MHD_add_response_header(r, "Content-Type", "text/html; charset=utf-8");
+	MHD_add_response_header(r, "X-Content-Type-Options", "nosniff");
+	MHD_add_response_header(r, "Cache-Control", "no-store");
+	MHD_add_response_header(r, "Content-Security-Policy",
+	                        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+	                        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+	res ret = MHD_queue_response(c, 200, r);
+	MHD_destroy_response(r);
+	return ret;
+}
+
 static res dispatch(struct MHD_Connection *c, const char *url, const char *method, body *bd) {
+	if (!strcmp(url, "/admin")) return admin_page(c);
 	if (!strcmp(url, "/.well-known/atproto-did")) return well_known_did(c);
 	if (!strcmp(url, "/.well-known/did.json")) return service_did_doc(c);
 	if (!strcmp(url, "/tls-check")) return tls_check(c);
@@ -2103,16 +2401,12 @@ static void done(void *cls, struct MHD_Connection *c, void **ctx, enum MHD_Reque
 	*ctx = NULL;
 }
 
-static const char *env(const char *k, const char *def) {
-	const char *v = getenv(k);
-	return v && *v ? v : def;
-}
-
 int main(void) {
 	hostname = env("PDS_HOSTNAME", "localhost");
 	int port = atoi(env("PDS_PORT", "2583"));
 	invite_required = strcmp(env("PDS_INVITE_REQUIRED", "true"), "false") != 0;
 	trust_proxy = !strcmp(env("PDS_TRUST_PROXY", "false"), "true");
+	require_email_confirmed = !strcmp(env("PDS_REQUIRE_EMAIL_CONFIRMED", "false"), "true");
 	RAND_bytes((unsigned char *)&rl_seed, sizeof rl_seed);
 	const char *admin_pw = getenv("PDS_ADMIN_PASSWORD");
 	if (admin_pw && *admin_pw) {
@@ -2140,6 +2434,12 @@ int main(void) {
 	crawlers = env("PDS_CRAWLERS", local ? NULL : "https://bsky.network");
 	appview_url = env("PDS_APPVIEW_URL", "https://api.bsky.app");
 	appview_did = env("PDS_APPVIEW_DID", "did:web:api.bsky.app");
+	smtp_url = env("PDS_EMAIL_SMTP_URL", NULL);
+	mail_from = env("PDS_EMAIL_FROM_ADDRESS", NULL);
+	if (smtp_url && !mail_from) {
+		fprintf(stderr, "PDS_EMAIL_SMTP_URL needs PDS_EMAIL_FROM_ADDRESS\n");
+		return 1;
+	}
 	curl_global_init(CURL_GLOBAL_DEFAULT);
 	pthread_mutexattr_t ma;
 	pthread_mutexattr_init(&ma);
@@ -2156,7 +2456,9 @@ int main(void) {
 	                 " rkey TEXT NOT NULL, cid TEXT NOT NULL, value TEXT NOT NULL,"
 	                 " PRIMARY KEY(did, collection, rkey));"
 	                 "CREATE TABLE IF NOT EXISTS invite(code TEXT PRIMARY KEY, uses_left INTEGER NOT NULL,"
-	                 " for_account TEXT NOT NULL);"
+	                 " for_account TEXT NOT NULL, created_at TEXT);"
+	                 "CREATE TABLE IF NOT EXISTS email_token(did TEXT NOT NULL, purpose TEXT NOT NULL,"
+	                 " token TEXT NOT NULL, requested_at INTEGER NOT NULL, PRIMARY KEY(did, purpose));"
 	                 "CREATE TABLE IF NOT EXISTS pref(did TEXT PRIMARY KEY, prefs TEXT NOT NULL);"
 	                 "CREATE TABLE IF NOT EXISTS blob(did TEXT NOT NULL, cid TEXT NOT NULL, mime TEXT NOT NULL,"
 	                 " size INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(did, cid));"
@@ -2169,6 +2471,8 @@ int main(void) {
 	/* columns added after the first schema; fails harmlessly once present */
 	sqlite3_exec(db, "ALTER TABLE account ADD COLUMN created_at TEXT", NULL, NULL, NULL);
 	sqlite3_exec(db, "ALTER TABLE account ADD COLUMN takedown TEXT", NULL, NULL, NULL);
+	sqlite3_exec(db, "ALTER TABLE account ADD COLUMN email_confirmed_at TEXT", NULL, NULL, NULL);
+	sqlite3_exec(db, "ALTER TABLE invite ADD COLUMN created_at TEXT", NULL, NULL, NULL);
 	sqlite3_stmt *s = q("SELECT ifnull(max(seq), 0) FROM event", 0);
 	sqlite3_step(s);
 	sent_seq = sqlite3_column_int64(s, 0);

@@ -3,7 +3,7 @@
 set -eu
 PORT=${PORT:-2599}
 DB=$(mktemp -d)/t.sqlite
-PDS_PORT=$PORT PDS_DB=$DB PDS_JWT_SECRET=test PDS_ADMIN_PASSWORD=adminpw PDS_APPVIEW_URL=http://127.0.0.1:9 ./pds 2>/dev/null &
+PDS_PORT=$PORT PDS_DB=$DB PDS_JWT_SECRET=test PDS_ADMIN_PASSWORD=adminpw PDS_APPVIEW_URL=http://127.0.0.1:9 ./pds 2>"$DB.log" &
 PID=$!
 trap 'kill $PID' EXIT
 for _ in $(seq 50); do curl -s localhost:$PORT >/dev/null && break; sleep 0.1; done
@@ -95,6 +95,51 @@ post com.atproto.identity.updateHandle '{"handle":"Alice2.localhost"}' | grep -q
 get "com.atproto.identity.resolveHandle?handle=alice2.localhost" | grep -q "$DID" || fail resolve-new-handle
 post com.atproto.identity.updateHandle '{"handle":"alice.localhost"}' >/dev/null
 
+# email: no SMTP configured, so the token shows up in the server log
+mailtok() { sleep 0.2; grep -o '[A-Z2-7]\{5\}-[A-Z2-7]\{5\}' "$DB.log" | tail -1; }
+curl -s -H "Authorization: Bearer $TOK" "$U/com.atproto.server.getSession" | grep -q '"emailConfirmed":false' || fail email-unconfirmed
+post com.atproto.server.requestEmailConfirmation '' | grep -q '^{}$' || fail requestEmailConfirmation
+ET=$(mailtok)
+post com.atproto.server.confirmEmail '{"email":"a@x.io","token":"AAAAA-AAAAA"}' | grep -q InvalidToken || fail confirm-badtoken
+post com.atproto.server.confirmEmail "{\"email\":\"b@x.io\",\"token\":\"$ET\"}" | grep -q InvalidEmail || fail confirm-bademail
+post com.atproto.server.confirmEmail "{\"email\":\"A@x.io\",\"token\":\"$ET\"}" | grep -q '^{}$' || fail confirmEmail
+post com.atproto.server.confirmEmail "{\"email\":\"a@x.io\",\"token\":\"$ET\"}" | grep -q InvalidToken || fail confirm-reuse
+curl -s -H "Authorization: Bearer $TOK" "$U/com.atproto.server.getSession" | grep -q '"emailConfirmed":true' || fail email-confirmed
+post com.atproto.server.updateEmail '{"email":"new@x.io"}' | grep -q TokenRequired || fail update-notoken
+post com.atproto.server.requestEmailUpdate '' | grep -q '"tokenRequired":true' || fail requestEmailUpdate
+post com.atproto.server.updateEmail "{\"email\":\"bad\r\nBcc: x@y\",\"token\":\"$(mailtok)\"}" | grep -q 'invalid email' || fail update-inject
+post com.atproto.server.updateEmail "{\"email\":\"new@x.io\",\"token\":\"$(mailtok)\"}" | grep -q '^{}$' || fail updateEmail
+curl -s -H "Authorization: Bearer $TOK" "$U/com.atproto.server.getSession" | grep -q '"email":"new@x.io","emailConfirmed":false' || fail email-updated
+post com.atproto.server.requestEmailUpdate '' | grep -q '"tokenRequired":false' || fail update-unconfirmed
+post com.atproto.server.updateEmail '{"email":"a@x.io"}' | grep -q '^{}$' || fail update-back
+TOK= post com.atproto.server.requestEmailConfirmation '' | grep -q AuthenticationRequired || fail email-noauth
+
+# password reset by mailed token; never reveals whether an email has an account
+TOK= post com.atproto.server.requestPasswordReset '{"email":"nobody@x.io"}' | grep -q '^{}$' || fail reset-unknown
+TOK= post com.atproto.server.requestPasswordReset '{"email":"A@x.io"}' | grep -q '^{}$' || fail requestPasswordReset
+RT=$(mailtok)
+TOK= post com.atproto.server.resetPassword '{"token":"AAAAA-AAAAA","password":"x"}' | grep -q InvalidToken || fail reset-badtoken
+TOK= post com.atproto.server.resetPassword "{\"token\":\"$(echo $RT | tr A-Z a-z)\",\"password\":\"pw2\"}" | grep -q '^{}$' || fail resetPassword
+TOK= post com.atproto.server.resetPassword "{\"token\":\"$RT\",\"password\":\"pw3\"}" | grep -q InvalidToken || fail reset-reuse
+TOK= post com.atproto.server.createSession '{"identifier":"a@x.io","password":"pw"}' | grep -q AuthenticationRequired || fail reset-oldpw
+TOK= post com.atproto.server.createSession '{"identifier":"a@x.io","password":"pw2"}' | grep -q accessJwt || fail reset-newpw
+
+# PDS_REQUIRE_EMAIL_CONFIRMED: writes wait for a confirmed email (second server)
+P2=$((PORT+1)); D2=$(mktemp -d)
+PDS_PORT=$P2 PDS_DB=$D2/t.sqlite PDS_JWT_SECRET=t PDS_INVITE_REQUIRED=false PDS_REQUIRE_EMAIL_CONFIRMED=true ./pds 2>"$D2/log" &
+PID2=$!; trap 'kill $PID $PID2' EXIT
+for _ in $(seq 50); do curl -s localhost:$P2 >/dev/null && break; sleep 0.1; done
+post2() { (U=http://localhost:$P2/xrpc; TOK=${GT:-}; post "$@"); }
+R=$(post2 com.atproto.server.createAccount '{"handle":"g.localhost","password":"p","email":"g@x.io"}')
+GD=$(echo "$R" | field did); GT=$(echo "$R" | field accessJwt)
+W="{\"repo\":\"$GD\",\"collection\":\"app.bsky.feed.post\",\"record\":{\"text\":\"x\"}}"
+post2 com.atproto.repo.createRecord "$W" | grep -q EmailNotConfirmed || fail gate-write
+curl -s -X POST -H "Authorization: Bearer $GT" --data-binary x "http://localhost:$P2/xrpc/com.atproto.repo.uploadBlob" | grep -q EmailNotConfirmed || fail gate-blob
+post2 com.atproto.server.requestEmailConfirmation '' >/dev/null
+sleep 0.2; GE=$(grep -o '[A-Z2-7]\{5\}-[A-Z2-7]\{5\}' "$D2/log" | tail -1)
+post2 com.atproto.server.confirmEmail "{\"email\":\"g@x.io\",\"token\":\"$GE\"}" | grep -q '^{}$' || fail gate-confirm
+post2 com.atproto.repo.createRecord "$W" | grep -q commit || fail gate-open
+
 # firehose handshake (RFC 6455 sample key -> known accept value)
 curl -s -i --max-time 1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
   -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$U/com.atproto.sync.subscribeRepos?cursor=0" 2>/dev/null |
@@ -125,6 +170,16 @@ echo y | adm account delete "$CDID" | grep -q "$CDID deleted" || fail cli-delete
 adm account list | grep -q carol.localhost && fail delete-listed
 get "com.atproto.repo.describeRepo?repo=$CDID" | grep -q RepoNotFound || fail delete-gone
 adm help | grep -q 'reset-password <DID>' || fail cli-help
+# web admin panel + the invite routes it uses
+ADM="-u admin:adminpw"
+curl -s -D - -o /dev/null "http://localhost:$PORT/admin" | grep -qi "content-security-policy: default-src 'none'; script-src" || fail admin-page
+curl -s "http://localhost:$PORT/admin" | grep -q '<title>PDS Admin</title>' || fail admin-page-body
+get com.atproto.admin.getInviteCodes | grep -q AuthenticationRequired || fail invites-noadmin
+curl -s $ADM "$U/com.atproto.admin.getInviteCodes" | grep -q "\"code\":\"$CODE\",\"available\":0" || fail invites-list
+C2=$(curl -s -X POST $ADM -H 'Content-Type: application/json' -d '{"useCount":5}' "$U/com.atproto.server.createInviteCode" | field code)
+curl -s $ADM "$U/com.atproto.admin.getInviteCodes" | grep -q "\"code\":\"$C2\",\"available\":5" || fail invites-new
+curl -s -X POST $ADM -H 'Content-Type: application/json' -d "{\"codes\":[\"$C2\"]}" "$U/com.atproto.admin.disableInviteCodes" | grep -q '^{}$' || fail invites-disable
+post com.atproto.server.createAccount "{\"handle\":\"dave.localhost\",\"password\":\"x\",\"inviteCode\":\"$C2\"}" | grep -q InvalidInviteCode || fail invites-disabled
 
 # Caddy on-demand TLS ask hook
 curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/tls-check?domain=localhost" | grep -q 200 || fail tls-host
