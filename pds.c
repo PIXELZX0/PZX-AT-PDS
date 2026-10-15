@@ -1317,80 +1317,114 @@ static res list_records(struct MHD_Connection *c, cJSON *b) {
 
 enum { CREATE, PUT, DELETE };
 
+typedef struct {
+	int op, exists, changed;
+	const char *col, *rkey;
+	cJSON *rec;
+	char rk[14], cid[64], cur[64], path[1024];
+} write_t;
+
+/* Checks one write against the repo and fills in rkey, cid and the current
+ * version. Returns an error message (and its XRPC name), or NULL if fine. */
+static const char *prep_write(const char *did, write_t *w, const cJSON *swap, const char **name) {
+	*name = "InvalidRequest";
+	if (!w->col || !valid_nsid(w->col)) return "invalid collection";
+	if (!w->rkey && w->op == CREATE) tid(w->rk), w->rkey = w->rk;
+	if (!w->rkey || !valid_rkey(w->rkey)) return "invalid rkey";
+	snprintf(w->path, sizeof w->path, "%s/%s", w->col, w->rkey);
+	sqlite3_stmt *s = q("SELECT cid FROM record WHERE did=? AND collection=? AND rkey=?", 3, did, w->col, w->rkey);
+	if ((w->exists = sqlite3_step(s) == SQLITE_ROW)) snprintf(w->cur, sizeof w->cur, "%s", sqlite3_column_text(s, 0));
+	sqlite3_finalize(s);
+	if (swap && w->op != CREATE &&
+	    (cJSON_IsNull(swap) ? w->exists : !cJSON_IsString(swap) || !w->exists || strcmp(swap->valuestring, w->cur)))
+		return *name = "InvalidSwap", "record was at a different version";
+	if (w->op == CREATE && w->exists) return "record already exists";
+	if (w->op == DELETE) return NULL;
+	*name = "InvalidRecord";
+	if (!cJSON_IsObject(w->rec)) return "record must be an object";
+	cJSON *type = cJSON_GetObjectItemCaseSensitive(w->rec, "$type");
+	if (!type) cJSON_AddStringToObject(w->rec, "$type", w->col);
+	else if (!cJSON_IsString(type) || strcmp(type->valuestring, w->col)) return "$type must match collection";
+	return record_cid(w->rec, w->cid) ? "record is not valid atproto data" : NULL;
+}
+
+/* Applies writes as one signed commit and one #commit event, or not at all.
+ * Returns how many writes changed something (0: no commit made), -1 on error. */
+static int commit_writes(const char *did, const char *since, write_t *w, int n, char ccid[64], char rev[14]) {
+	buf old = {0}, now = {0}, diff = {0};
+	unsigned char prev_data[36], root[36], (*cids)[2][36] = calloc((size_t)n, sizeof *cids);
+	repo_op *ops = calloc((size_t)n, sizeof *ops);
+	int rc = 0, changed = 0;
+	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+	mst_root(did, &old, NULL, prev_data);
+	for (int i = 0; i < n && !rc; i++) {
+		char *json = w[i].op == DELETE ? NULL : cJSON_PrintUnformatted(w[i].rec);
+		rc = exec1(json ? q("INSERT OR REPLACE INTO record(did,collection,rkey,cid,value) VALUES(?,?,?,?,?)", 5, did,
+		                    w[i].col, w[i].rkey, w[i].cid, json)
+		                : q("DELETE FROM record WHERE did=? AND collection=? AND rkey=?", 3, did, w[i].col, w[i].rkey));
+		free(json);
+		changed += w[i].changed = !rc && sqlite3_changes(db) > 0;
+	}
+	if (!rc && changed) rc = new_commit(did, &now, ccid, rev);
+	if (!rc && changed) {
+		car_diff(&diff, &now, &old);
+		int nops = 0;
+		for (int i = 0; i < n; i++) {
+			if (!w[i].changed) continue;
+			/* ops must be invertible from the event alone (sync 1.1): send the
+			 * new nodes plus each key's search path, which may reuse old nodes */
+			buf proof = {0};
+			mst_root(did, &proof, w[i].path, root);
+			car_diff(&diff, &proof, &diff);
+			free(proof.p);
+			if (w[i].rec) {
+				buf rb = {0};
+				cbor(&rb, w[i].rec);
+				emit(&diff, &rb, cids[i][0]);
+				free(rb.p);
+			}
+			ops[nops++] = (repo_op){w[i].op == DELETE ? "delete" : w[i].exists ? "update" : "create", w[i].path,
+			                        w[i].rec ? cids[i][0] : NULL,
+			                        w[i].exists && !cid_parse(w[i].cur, cids[i][1]) ? cids[i][1] : NULL};
+		}
+		rc = commit_event(did, since, prev_data, ccid, rev, &diff, ops, nops);
+	}
+	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
+	free(old.p), free(now.p), free(diff.p), free(cids), free(ops);
+	broadcast();
+	return rc ? -1 : changed;
+}
+
 static void add_commit(cJSON *o, const char *cid, const char *rev) {
 	cJSON *c = cJSON_AddObjectToObject(o, "commit");
 	cJSON_AddStringToObject(c, "cid", cid);
 	cJSON_AddStringToObject(c, "rev", rev);
 }
 
-static res repo_write(struct MHD_Connection *c, cJSON *b, int op) {
-	char did[64], rk[14], cid[64] = "", cur[64] = "";
-	account a;
+/* Shared front half of every write: the caller must own the repo, and an
+ * optional swapCommit must match the current head. Returns an error or 0. */
+static res writer(struct MHD_Connection *c, const cJSON *b, account *a) {
+	char did[64];
 	if (auth(c, "com.atproto.access", did)) return err(c, 401, "AuthenticationRequired", "invalid or expired token");
-	if (find_account(str(b, "repo"), 0, &a) || strcmp(a.did, did))
+	if (find_account(str(b, "repo"), 0, a) || strcmp(a->did, did))
 		return err(c, 403, "Forbidden", "can only write to your own repo");
-	const char *col = str(b, "collection"), *rkey = str(b, "rkey");
-	if (!col || !valid_nsid(col)) return err(c, 400, "InvalidRequest", "invalid collection");
-	if (!rkey && op == CREATE) tid(rk), rkey = rk;
-	if (!rkey || !valid_rkey(rkey)) return err(c, 400, "InvalidRequest", "invalid rkey");
+	const char *swap = str(b, "swapCommit");
+	if (swap && strcmp(swap, a->head)) return err(c, 400, "InvalidSwap", "repo head has moved");
+	return 0;
+}
 
-	sqlite3_stmt *s = q("SELECT cid FROM record WHERE did=? AND collection=? AND rkey=?", 3, did, col, rkey);
-	int exists = sqlite3_step(s) == SQLITE_ROW;
-	if (exists) snprintf(cur, sizeof cur, "%s", sqlite3_column_text(s, 0));
-	sqlite3_finalize(s);
-	cJSON *swap = cJSON_GetObjectItemCaseSensitive(b, "swapRecord");
-	if (swap && op != CREATE &&
-	    (cJSON_IsNull(swap) ? exists : !cJSON_IsString(swap) || !exists || strcmp(swap->valuestring, cur)))
-		return err(c, 400, "InvalidSwap", "record was at a different version");
-
-	char *json = NULL, ccid[64], rev[14], path[1024];
-	cJSON *rec = NULL;
-	if (op == CREATE && exists) return err(c, 400, "InvalidRequest", "record already exists");
-	if (op != DELETE) {
-		rec = cJSON_GetObjectItemCaseSensitive(b, "record");
-		if (!cJSON_IsObject(rec)) return err(c, 400, "InvalidRequest", "record must be an object");
-		cJSON *type = cJSON_GetObjectItemCaseSensitive(rec, "$type");
-		if (!type) cJSON_AddStringToObject(rec, "$type", col);
-		else if (!cJSON_IsString(type) || strcmp(type->valuestring, col))
-			return err(c, 400, "InvalidRecord", "$type must match collection");
-		if (record_cid(rec, cid)) return err(c, 400, "InvalidRecord", "record is not valid atproto data");
-		json = cJSON_PrintUnformatted(rec);
-	}
-
-	buf old = {0}, now = {0}, diff = {0};
-	unsigned char prev_data[36], proof_root[36], new_cid[36], old_cid[36];
-	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
-	mst_root(did, &old, NULL, prev_data);
-	int rc = exec1(op == DELETE ? q("DELETE FROM record WHERE did=? AND collection=? AND rkey=?", 3, did, col, rkey)
-	                            : q("INSERT OR REPLACE INTO record(did,collection,rkey,cid,value) VALUES(?,?,?,?,?)",
-	                                5, did, col, rkey, cid, json));
-	int changed = !rc && sqlite3_changes(db) > 0;
-	if (changed) rc = new_commit(did, &now, ccid, rev);
-	if (changed && !rc) {
-		/* ops must be invertible from the event alone (sync 1.1): send the new
-		 * nodes plus the key's search path, which may reuse unchanged nodes */
-		buf proof = {0};
-		snprintf(path, sizeof path, "%s/%s", col, rkey);
-		mst_root(did, &proof, path, proof_root);
-		car_diff(&diff, &now, &old);
-		car_diff(&diff, &proof, &diff);
-		free(proof.p);
-		if (rec) {
-			buf rb = {0};
-			cbor(&rb, rec);
-			emit(&diff, &rb, new_cid);
-			free(rb.p);
-		}
-		repo_op o = {op == DELETE ? "delete" : exists ? "update" : "create", path, rec ? new_cid : NULL,
-		             exists && !cid_parse(cur, old_cid) ? old_cid : NULL};
-		rc = commit_event(did, a.rev, prev_data, ccid, rev, &diff, &o, 1);
-	}
-	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
-	free(json), free(old.p), free(now.p), free(diff.p);
-	broadcast();
-	if (rc) return err(c, 500, "InternalServerError", "write failed");
-
-	cJSON *o = op == DELETE ? cJSON_CreateObject() : record_view(did, col, rkey, cid, NULL);
+static res repo_write(struct MHD_Connection *c, cJSON *b, int op) {
+	account a;
+	char ccid[64], rev[14];
+	res r = writer(c, b, &a);
+	if (r) return r;
+	write_t w = {.op = op, .col = str(b, "collection"), .rkey = str(b, "rkey")};
+	w.rec = op == DELETE ? NULL : cJSON_GetObjectItemCaseSensitive(b, "record");
+	const char *name, *e = prep_write(a.did, &w, cJSON_GetObjectItemCaseSensitive(b, "swapRecord"), &name);
+	if (e) return err(c, 400, name, e);
+	int changed = commit_writes(a.did, a.rev, &w, 1, ccid, rev);
+	if (changed < 0) return err(c, 500, "InternalServerError", "write failed");
+	cJSON *o = op == DELETE ? cJSON_CreateObject() : record_view(a.did, w.col, w.rkey, w.cid, NULL);
 	if (changed) add_commit(o, ccid, rev);
 	if (op != DELETE) cJSON_AddStringToObject(o, "validationStatus", "unknown");
 	return reply(c, 200, o);
@@ -1399,6 +1433,56 @@ static res repo_write(struct MHD_Connection *c, cJSON *b, int op) {
 static res create_record(struct MHD_Connection *c, cJSON *b) { return repo_write(c, b, CREATE); }
 static res put_record(struct MHD_Connection *c, cJSON *b) { return repo_write(c, b, PUT); }
 static res delete_record(struct MHD_Connection *c, cJSON *b) { return repo_write(c, b, DELETE); }
+
+static res apply_writes(struct MHD_Connection *c, cJSON *b) {
+	static const char *kinds[] = {"#create", "#update", "#delete"}, *results[] = {"#createResult", "#updateResult",
+	                                                                            "#deleteResult"};
+	account a;
+	char ccid[64], rev[14], t[80];
+	res r = writer(c, b, &a);
+	if (r) return r;
+	cJSON *ws = cJSON_GetObjectItemCaseSensitive(b, "writes"), *x;
+	int n = cJSON_GetArraySize(ws), i = 0;
+	if (!cJSON_IsArray(ws) || n < 1 || n > 200) return err(c, 400, "InvalidRequest", "writes must hold 1-200 items");
+	write_t *w = calloc((size_t)n, sizeof *w);
+	const char *e = NULL, *name = "InvalidRequest";
+	cJSON_ArrayForEach(x, ws) {
+		const char *type = str(x, "$type"), *hash = type ? strchr(type, '#') : NULL;
+		w[i].op = -1;
+		for (int k = 0; k < 3; k++)
+			if (hash && !strncmp(type, "com.atproto.repo.applyWrites", (size_t)(hash - type)) &&
+			    hash - type == 28 && !strcmp(hash, kinds[k]))
+				w[i].op = k;
+		if (w[i].op < 0) {
+			e = "unknown write $type", name = "InvalidRequest";
+			break;
+		}
+		w[i].col = str(x, "collection"), w[i].rkey = str(x, "rkey");
+		w[i].rec = w[i].op == DELETE ? NULL : cJSON_GetObjectItemCaseSensitive(x, "value");
+		if ((e = prep_write(a.did, &w[i], NULL, &name))) break;
+		for (int j = 0; j < i && !e; j++)
+			if (!strcmp(w[j].path, w[i].path)) e = "duplicate write to one record", name = "InvalidRequest";
+		if (e) break;
+		i++;
+	}
+	int changed = e ? 0 : commit_writes(a.did, a.rev, w, n, ccid, rev);
+	if (e || changed < 0) {
+		free(w);
+		return e ? err(c, 400, name, e) : err(c, 500, "InternalServerError", "write failed");
+	}
+	cJSON *o = cJSON_CreateObject(), *res_ = cJSON_CreateArray();
+	if (changed) add_commit(o, ccid, rev);
+	for (i = 0; i < n; i++) {
+		cJSON *one = w[i].op == DELETE ? cJSON_CreateObject() : record_view(a.did, w[i].col, w[i].rkey, w[i].cid, NULL);
+		snprintf(t, sizeof t, "com.atproto.repo.applyWrites%s", results[w[i].op]);
+		cJSON_AddStringToObject(one, "$type", t);
+		if (w[i].op != DELETE) cJSON_AddStringToObject(one, "validationStatus", "unknown");
+		cJSON_AddItemToArray(res_, one);
+	}
+	cJSON_AddItemToObject(o, "results", res_);
+	free(w);
+	return reply(c, 200, o);
+}
 
 /* ---------- sync ---------- */
 
@@ -1566,6 +1650,7 @@ static const struct {
     {"/xrpc/com.atproto.repo.createRecord", 1, create_record},
     {"/xrpc/com.atproto.repo.putRecord", 1, put_record},
     {"/xrpc/com.atproto.repo.deleteRecord", 1, delete_record},
+    {"/xrpc/com.atproto.repo.applyWrites", 1, apply_writes},
     {"/xrpc/com.atproto.sync.getRepo", 0, get_repo},
     {"/xrpc/com.atproto.sync.getLatestCommit", 0, get_latest_commit},
     {"/xrpc/com.atproto.sync.getRepoStatus", 0, get_repo_status},
