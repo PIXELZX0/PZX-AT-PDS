@@ -3,7 +3,7 @@
 set -eu
 PORT=${PORT:-2599}
 DB=$(mktemp -d)/t.sqlite
-PDS_PORT=$PORT PDS_DB=$DB PDS_JWT_SECRET=test PDS_APPVIEW_URL=http://127.0.0.1:9 ./pds 2>/dev/null &
+PDS_PORT=$PORT PDS_DB=$DB PDS_JWT_SECRET=test PDS_ADMIN_PASSWORD=adminpw PDS_APPVIEW_URL=http://127.0.0.1:9 ./pds 2>/dev/null &
 PID=$!
 trap 'kill $PID' EXIT
 for _ in $(seq 50); do curl -s localhost:$PORT >/dev/null && break; sleep 0.1; done
@@ -16,11 +16,19 @@ field() { python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1
 get _health | grep -q version || fail health
 get com.atproto.server.describeServer | grep -q '".localhost"' || fail describeServer
 
-R=$(post com.atproto.server.createAccount '{"handle":"Alice.localhost","password":"pw","email":"a@x.io"}')
+# signup needs an invite code minted by the admin
+get com.atproto.server.describeServer | grep -q '"inviteCodeRequired":true' || fail invite-flag
+post com.atproto.server.createAccount '{"handle":"alice.localhost","password":"pw"}' | grep -q InvalidInviteCode || fail no-invite
+post com.atproto.server.createInviteCode '{"useCount":1}' | grep -q AuthenticationRequired || fail invite-noadmin
+curl -s -X POST -u admin:wrong -H 'Content-Type: application/json' -d '{"useCount":1}' "$U/com.atproto.server.createInviteCode" | grep -q AuthenticationRequired || fail invite-badadmin
+CODE=$(curl -s -X POST -u admin:adminpw -H 'Content-Type: application/json' -d '{"useCount":1}' "$U/com.atproto.server.createInviteCode" | field code)
+case $CODE in localhost-*) ;; *) fail "createInviteCode $CODE";; esac
+R=$(post com.atproto.server.createAccount "{\"handle\":\"Alice.localhost\",\"password\":\"pw\",\"email\":\"a@x.io\",\"inviteCode\":\"$CODE\"}")
 DID=$(echo "$R" | field did); TOK=$(echo "$R" | field accessJwt); REF=$(echo "$R" | field refreshJwt)
 case $DID in did:plc:*) ;; *) fail "createAccount $R";; esac
 post com.atproto.server.createAccount '{"handle":"alice.localhost","password":"x"}' | grep -q HandleNotAvailable || fail dup handle
 post com.atproto.server.createAccount '{"handle":"bob.evil.com","password":"x"}' | grep -q InvalidHandle || fail bad handle
+post com.atproto.server.createAccount "{\"handle\":\"bob.localhost\",\"password\":\"x\",\"inviteCode\":\"$CODE\"}" | grep -q InvalidInviteCode || fail invite-reuse
 
 TOK= post com.atproto.server.createSession '{"identifier":"a@x.io","password":"pw"}' | grep -q accessJwt || fail login
 TOK= post com.atproto.server.createSession '{"identifier":"alice.localhost","password":"no"}' | grep -q AuthenticationRequired || fail badpw

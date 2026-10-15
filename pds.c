@@ -45,6 +45,8 @@ static const char *appview_url, *appview_did;
 static pthread_mutex_t big;
 static char endpoint[300], service_did[300];
 static unsigned char jwt_secret[32];
+static int invite_required;
+static char admin_basic[400]; /* expected "Basic <base64(admin:password)>", empty: admin disabled */
 
 /* ---------- encoding helpers ---------- */
 
@@ -1126,7 +1128,7 @@ static res describe_server(struct MHD_Connection *c, cJSON *b) {
 	cJSON *o = cJSON_CreateObject();
 	cJSON_AddStringToObject(o, "did", service_did);
 	cJSON_AddItemToObject(o, "availableUserDomains", cJSON_CreateStringArray(doms, 1));
-	cJSON_AddBoolToObject(o, "inviteCodeRequired", 0);
+	cJSON_AddBoolToObject(o, "inviteCodeRequired", invite_required);
 	return reply(c, 200, o);
 }
 
@@ -1142,6 +1144,13 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 	account a;
 	if (!find_account(handle, 0, &a)) return err(c, 400, "HandleNotAvailable", "handle already taken");
 	if (email && !find_account(email, 1, &a)) return err(c, 400, "InvalidRequest", "email already taken");
+	const char *code = str(b, "inviteCode");
+	if (invite_required) {
+		sqlite3_stmt *s = q("SELECT 1 FROM invite WHERE code=? AND uses_left>0", 1, code);
+		int ok = code && sqlite3_step(s) == SQLITE_ROW;
+		sqlite3_finalize(s);
+		if (!ok) return err(c, 400, "InvalidInviteCode", "invite code is missing, unknown or used up");
+	}
 
 	unsigned char salt[16];
 	RAND_bytes(salt, sizeof salt);
@@ -1158,6 +1167,7 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 	buf blocks = {0};
 	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
 	int rc = !op ||
+	         (invite_required && exec1(q("UPDATE invite SET uses_left=uses_left-1 WHERE code=?", 1, code))) ||
 	         exec1(q("INSERT INTO account(did,handle,email,salt,hash,key,pubkey,plc_op) VALUES(?,?,?,?,?,?,?,?)", 8,
 	                 a.did, a.handle, email, a.salt, a.hash, pem, a.pubkey, op)) ||
 	         new_commit(a.did, &blocks, a.head, a.rev) || /* empty repo */
@@ -1169,6 +1179,34 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 	if (rc) return err(c, 500, "InternalServerError", "could not create account");
 	request_crawl();
 	return session(c, &a);
+}
+
+/* Admin calls use HTTP Basic auth as user "admin" with PDS_ADMIN_PASSWORD. */
+static int admin(struct MHD_Connection *c) {
+	const char *h = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Authorization");
+	size_t n = strlen(admin_basic);
+	return n && h && strlen(h) == n && !CRYPTO_memcmp(h, admin_basic, n) ? 0 : -1;
+}
+
+static res create_invite_code(struct MHD_Connection *c, cJSON *b) {
+	if (admin(c)) return err(c, 401, "AuthenticationRequired", "admin auth required");
+	cJSON *uc = cJSON_GetObjectItemCaseSensitive(b, "useCount");
+	const char *for_acct = str(b, "forAccount");
+	if (!cJSON_IsNumber(uc) || uc->valuedouble < 1 || uc->valuedouble > 100000 || uc->valuedouble != floor(uc->valuedouble))
+		return err(c, 400, "InvalidRequest", "useCount must be a positive integer");
+	unsigned char rnd[10];
+	char code[300], tail[20], uses[16];
+	RAND_bytes(rnd, sizeof rnd);
+	b32(rnd, sizeof rnd, tail); /* 16 chars, 80 bits */
+	snprintf(code, sizeof code, "%s-%.5s-%.5s-%.6s", hostname, tail, tail + 5, tail + 10);
+	for (char *p = code; *p; p++) *p = *p == '.' ? '-' : *p;
+	snprintf(uses, sizeof uses, "%d", (int)uc->valuedouble);
+	if (exec1(q("INSERT INTO invite(code, uses_left, for_account) VALUES(?, CAST(? AS INTEGER), ?)", 3, code, uses,
+	            for_acct ? for_acct : "admin")))
+		return err(c, 500, "InternalServerError", "could not create invite code");
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "code", code);
+	return reply(c, 200, o);
 }
 
 static res create_session(struct MHD_Connection *c, cJSON *b) {
@@ -1729,6 +1767,7 @@ static const struct {
     {"/xrpc/_health", 0, health},
     {"/xrpc/com.atproto.server.describeServer", 0, describe_server},
     {"/xrpc/com.atproto.server.createAccount", 1, create_account},
+    {"/xrpc/com.atproto.server.createInviteCode", 1, create_invite_code},
     {"/xrpc/com.atproto.server.createSession", 1, create_session},
     {"/xrpc/com.atproto.server.getSession", 0, get_session},
     {"/xrpc/com.atproto.server.refreshSession", 1, refresh_session},
@@ -1866,6 +1905,19 @@ static const char *env(const char *k, const char *def) {
 int main(void) {
 	hostname = env("PDS_HOSTNAME", "localhost");
 	int port = atoi(env("PDS_PORT", "2583"));
+	invite_required = strcmp(env("PDS_INVITE_REQUIRED", "true"), "false") != 0;
+	const char *admin_pw = getenv("PDS_ADMIN_PASSWORD");
+	if (admin_pw && *admin_pw) {
+		char userpass[300], *enc = admin_basic + 6;
+		if (snprintf(userpass, sizeof userpass, "admin:%s", admin_pw) >= (int)sizeof userpass) {
+			fprintf(stderr, "PDS_ADMIN_PASSWORD too long\n");
+			return 1;
+		}
+		strcpy(admin_basic, "Basic ");
+		EVP_EncodeBlock((unsigned char *)enc, (unsigned char *)userpass, (int)strlen(userpass));
+	} else if (invite_required) {
+		fprintf(stderr, "warning: invites required but PDS_ADMIN_PASSWORD unset, so no one can sign up\n");
+	}
 	const char *secret = getenv("PDS_JWT_SECRET");
 	if (secret && *secret) SHA256((const unsigned char *)secret, strlen(secret), jwt_secret);
 	else {
@@ -1895,6 +1947,8 @@ int main(void) {
 	                 "CREATE TABLE IF NOT EXISTS record(did TEXT NOT NULL, collection TEXT NOT NULL,"
 	                 " rkey TEXT NOT NULL, cid TEXT NOT NULL, value TEXT NOT NULL,"
 	                 " PRIMARY KEY(did, collection, rkey));"
+	                 "CREATE TABLE IF NOT EXISTS invite(code TEXT PRIMARY KEY, uses_left INTEGER NOT NULL,"
+	                 " for_account TEXT NOT NULL);"
 	                 "CREATE TABLE IF NOT EXISTS pref(did TEXT PRIMARY KEY, prefs TEXT NOT NULL);"
 	                 "CREATE TABLE IF NOT EXISTS blob(did TEXT NOT NULL, cid TEXT NOT NULL, mime TEXT NOT NULL,"
 	                 " size INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(did, cid));"
