@@ -15,6 +15,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -731,10 +732,8 @@ static void broadcast(void) {
  * (ping/close) are never read. Move to per-subscriber queues + poll if needed. */
 static void subscribe(long long cursor, MHD_socket fd, struct MHD_UpgradeResponseHandle *urh) {
 	struct timeval tv = {5, 0};
-	int one = 1;
 	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 	if (nsubs == MAX_SUBS) {
 		MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
 		return;
@@ -2402,6 +2401,7 @@ static void done(void *cls, struct MHD_Connection *c, void **ctx, enum MHD_Reque
 }
 
 int main(void) {
+	signal(SIGPIPE, SIG_IGN); /* a subscriber hanging up mid-write must not kill us */
 	hostname = env("PDS_HOSTNAME", "localhost");
 	int port = atoi(env("PDS_PORT", "2583"));
 	invite_required = strcmp(env("PDS_INVITE_REQUIRED", "true"), "false") != 0;
