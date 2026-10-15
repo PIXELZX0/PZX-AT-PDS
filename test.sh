@@ -61,6 +61,18 @@ H2=$(get "com.atproto.sync.getLatestCommit?did=$DID" | field cid)
 get "com.atproto.sync.listRepos" | grep -q "\"head\":\"$H2\"" || fail listRepos
 curl -s -D - -o /dev/null "$U/com.atproto.sync.getRepo?did=$DID" | grep -qi 'content-type: application/vnd.ipld.car' || fail getRepo
 get "com.atproto.repo.describeRepo?repo=$DID" | grep -q '"publicKeyMultibase":"zQ3s' || fail didDoc key
+# blobs: raw-codec CID, bytes round-trip, served inert
+BLOBF=$(dirname "$DB")/blob.bin; head -c 3000 /dev/urandom > "$BLOBF"
+WANT=$(python3 -c 'import sys,hashlib,base64; d=open(sys.argv[1],"rb").read(); print("b"+base64.b32encode(bytes([1,0x55,0x12,0x20])+hashlib.sha256(d).digest()).decode().lower().rstrip("="))' "$BLOBF")
+R=$(curl -s -X POST -H "Authorization: Bearer $TOK" -H 'Content-Type: image/png' --data-binary @"$BLOBF" "$U/com.atproto.repo.uploadBlob")
+echo "$R" | grep -q "\"\$link\":\"$WANT\"" && echo "$R" | grep -q '"size":3000' || fail "uploadBlob $R"
+curl -s -X POST -H 'Content-Type: image/png' --data-binary @"$BLOBF" "$U/com.atproto.repo.uploadBlob" | grep -q AuthenticationRequired || fail blob-noauth
+curl -s "$U/com.atproto.sync.getBlob?did=$DID&cid=$WANT" | cmp -s - "$BLOBF" || fail getBlob
+curl -s -D - -o /dev/null "$U/com.atproto.sync.getBlob?did=$DID&cid=$WANT" | grep -qi 'x-content-type-options: nosniff' || fail blob-headers
+get "com.atproto.sync.listBlobs?did=$DID" | grep -q "$WANT" || fail listBlobs
+head -c 6000000 /dev/zero | curl -s -X POST -H "Authorization: Bearer $TOK" --data-binary @- "$U/com.atproto.repo.uploadBlob" | grep -q BlobTooLarge || fail blob-limit
+post com.atproto.repo.putRecord "{\"repo\":\"$DID\",\"collection\":\"app.bsky.actor.profile\",\"rkey\":\"self\",\"record\":{\"avatar\":$(echo "$R" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["blob"]))')}}" | grep -q commit || fail avatar
+
 # firehose handshake (RFC 6455 sample key -> known accept value)
 curl -s -i --max-time 1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
   -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$U/com.atproto.sync.subscribeRepos?cursor=0" 2>/dev/null |

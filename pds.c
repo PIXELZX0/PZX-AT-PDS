@@ -32,7 +32,7 @@
 #include <openssl/sha.h>
 #include <sqlite3.h>
 
-#define MAX_BODY (1 << 20)
+#define MAX_BODY (5 << 20) /* also the blob size limit */
 #define ACCESS_TTL (2 * 3600)
 #define REFRESH_TTL (60 * 24 * 3600)
 
@@ -855,6 +855,9 @@ static res send_raw(struct MHD_Connection *c, unsigned st, const char *type, voi
 	MHD_add_response_header(r, "Access-Control-Allow-Origin", "*");
 	MHD_add_response_header(r, "Access-Control-Allow-Headers", "*");
 	MHD_add_response_header(r, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+	/* blobs are user-supplied bytes: never let a browser run them as a page */
+	MHD_add_response_header(r, "X-Content-Type-Options", "nosniff");
+	MHD_add_response_header(r, "Content-Security-Policy", "default-src 'none'; sandbox");
 	res ret = MHD_queue_response(c, st, r);
 	MHD_destroy_response(r);
 	return ret;
@@ -1283,6 +1286,49 @@ static res get_repo(struct MHD_Connection *c, cJSON *b) {
 	return send_raw(c, 200, "application/vnd.ipld.car", car.p, car.n);
 }
 
+/* ---------- blobs ---------- */
+
+static res get_blob(struct MHD_Connection *c, cJSON *b) {
+	(void)b;
+	account a;
+	if (did_arg(c, &a)) return err(c, 400, "RepoNotFound", "could not find repo for DID");
+	sqlite3_stmt *s = q("SELECT mime, data FROM blob WHERE did=? AND cid=?", 2, a.did, ARG("cid"));
+	res r;
+	if (sqlite3_step(s) == SQLITE_ROW) {
+		size_t n = (size_t)sqlite3_column_bytes(s, 1);
+		void *data = malloc(n ? n : 1);
+		memcpy(data, sqlite3_column_blob(s, 1), n);
+		r = send_raw(c, 200, (const char *)sqlite3_column_text(s, 0), data, n);
+	} else {
+		r = err(c, 400, "BlobNotFound", "blob not found");
+	}
+	sqlite3_finalize(s);
+	return r;
+}
+
+static res list_blobs(struct MHD_Connection *c, cJSON *b) {
+	(void)b;
+	account a;
+	if (did_arg(c, &a)) return err(c, 400, "RepoNotFound", "could not find repo for DID");
+	const char *lim = ARG("limit");
+	int limit = lim ? atoi(lim) : 500;
+	if (limit < 1 || limit > 1000) return err(c, 400, "InvalidRequest", "limit must be 1-1000");
+	char limstr[8], last[64] = "";
+	snprintf(limstr, sizeof limstr, "%d", limit);
+	sqlite3_stmt *s = q("SELECT cid FROM blob WHERE did=?1 AND (?2 IS NULL OR cid>?2) ORDER BY cid "
+	                    "LIMIT CAST(?3 AS INTEGER)",
+	                    3, a.did, ARG("cursor"), limstr);
+	cJSON *o = cJSON_CreateObject(), *arr = cJSON_AddArrayToObject(o, "cids");
+	int n = 0;
+	for (; sqlite3_step(s) == SQLITE_ROW; n++) {
+		snprintf(last, sizeof last, "%s", sqlite3_column_text(s, 0));
+		cJSON_AddItemToArray(arr, cJSON_CreateString(last));
+	}
+	sqlite3_finalize(s);
+	if (n == limit) cJSON_AddStringToObject(o, "cursor", last);
+	return reply(c, 200, o);
+}
+
 static res subscribe_repos(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
 	const char *key = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Sec-WebSocket-Key"),
@@ -1329,6 +1375,8 @@ static const struct {
     {"/xrpc/com.atproto.sync.getRepoStatus", 0, get_repo_status},
     {"/xrpc/com.atproto.sync.listRepos", 0, list_repos},
     {"/xrpc/com.atproto.sync.subscribeRepos", 0, subscribe_repos},
+    {"/xrpc/com.atproto.sync.getBlob", 0, get_blob},
+    {"/xrpc/com.atproto.sync.listBlobs", 0, list_blobs},
 };
 
 /* Handle → DID over HTTPS: GET /.well-known/atproto-did with Host: <handle>. */
@@ -1344,6 +1392,32 @@ static res well_known_did(struct MHD_Connection *c) {
 }
 
 typedef struct { char *p; size_t n; int too_big; } body;
+
+/* Raw body (not JSON); the blob's CID is a raw-codec CIDv1.
+ * ponytail: blobs are kept forever, even if no record ever references them,
+ * and records aren't checked to reference blobs that exist. Add a GC sweep
+ * of unreferenced blobs if storage matters. */
+static res upload_blob(struct MHD_Connection *c, const body *bd) {
+	char did[64], cs[64], size[24];
+	if (auth(c, "com.atproto.access", did)) return err(c, 401, "AuthenticationRequired", "invalid or expired token");
+	if (bd->too_big) return err(c, 413, "BlobTooLarge", "blob exceeds 5MB");
+	const char *mime = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Content-Type");
+	if (!mime || !*mime || strlen(mime) > 128 || strpbrk(mime, "\r\n")) mime = "application/octet-stream";
+	unsigned char cid[36] = {0x01, 0x55, 0x12, 0x20}; /* v1, raw, sha2-256 */
+	SHA256(bd->n ? (unsigned char *)bd->p : (unsigned char *)"", bd->n, cid + 4);
+	cid_str(cid, cs);
+	snprintf(size, sizeof size, "%zu", bd->n);
+	sqlite3_stmt *s = q("INSERT OR IGNORE INTO blob(did,cid,mime,size,data) VALUES(?1,?2,?3,CAST(?4 AS INTEGER),?5)",
+	                    4, did, cs, mime, size);
+	sqlite3_bind_blob(s, 5, bd->n ? bd->p : "", (int)bd->n, SQLITE_TRANSIENT);
+	if (exec1(s)) return err(c, 500, "InternalServerError", "could not store blob");
+	cJSON *o = cJSON_CreateObject(), *blob = cJSON_AddObjectToObject(o, "blob");
+	cJSON_AddStringToObject(blob, "$type", "blob");
+	cJSON_AddStringToObject(cJSON_AddObjectToObject(blob, "ref"), "$link", cs);
+	cJSON_AddStringToObject(blob, "mimeType", mime);
+	cJSON_AddNumberToObject(blob, "size", (double)bd->n);
+	return reply(c, 200, o);
+}
 
 static res handler(void *cls, struct MHD_Connection *c, const char *url, const char *method, const char *ver,
                    const char *up, size_t *upsz, void **ctx) {
@@ -1365,6 +1439,8 @@ static res handler(void *cls, struct MHD_Connection *c, const char *url, const c
 	}
 	if (!strcmp(method, "OPTIONS")) return send_body(c, 204, "text/plain", strdup(""));
 	if (!strcmp(url, "/.well-known/atproto-did")) return well_known_did(c);
+	if (!strcmp(url, "/xrpc/com.atproto.repo.uploadBlob"))
+		return strcmp(method, "POST") ? err(c, 405, "InvalidRequest", "wrong HTTP method") : upload_blob(c, bd);
 	if (bd->too_big) return err(c, 413, "PayloadTooLarge", "request body too large");
 
 	for (size_t i = 0; i < sizeof routes / sizeof *routes; i++) {
@@ -1424,6 +1500,8 @@ int main(void) {
 	                 "CREATE TABLE IF NOT EXISTS record(did TEXT NOT NULL, collection TEXT NOT NULL,"
 	                 " rkey TEXT NOT NULL, cid TEXT NOT NULL, value TEXT NOT NULL,"
 	                 " PRIMARY KEY(did, collection, rkey));"
+	                 "CREATE TABLE IF NOT EXISTS blob(did TEXT NOT NULL, cid TEXT NOT NULL, mime TEXT NOT NULL,"
+	                 " size INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(did, cid));"
 	                 "CREATE TABLE IF NOT EXISTS event(seq INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT NOT NULL,"
 	                 " frame BLOB);",
 	                 NULL, NULL, NULL)) {
