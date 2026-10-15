@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <cjson/cJSON.h>
@@ -421,16 +423,20 @@ static void emit(buf *car, const buf *blk, unsigned char cid[36]) {
 	put(car, blk->p, blk->n);
 }
 
+/* Blocks go to car; with a key, only nodes on that key's search path (a proof). */
+typedef struct { const leaf *L; size_t n; buf *car; const char *key; } mst_ctx;
+
 /* Node at `layer` over sorted leaves [lo,hi), all with layer <= `layer`.
  * Leaves of this layer are entries; runs of lower ones become subtrees. */
-static void mst_node(const leaf *L, size_t lo, size_t hi, int layer, buf *car, unsigned char cid[36]) {
+static void mst_node(const mst_ctx *x, size_t lo, size_t hi, int layer, unsigned char cid[36]) {
+	const leaf *L = x->L;
 	buf b = {0};
 	unsigned char sub[36], left[36];
 	size_t n = 0, i = lo;
 	for (size_t k = lo; k < hi; k++) n += L[k].layer == layer;
 	while (i < hi && L[i].layer != layer) i++;
 	int has_left = i > lo;
-	if (has_left) mst_node(L, lo, i, layer - 1, car, left);
+	if (has_left) mst_node(x, lo, i, layer - 1, left);
 	head(&b, 5, 2);
 	text(&b, "e");
 	head(&b, 4, n);
@@ -442,7 +448,7 @@ static void mst_node(const leaf *L, size_t lo, size_t hi, int layer, buf *car, u
 		text(&b, "k"), head(&b, 2, strlen(L[i].key + p)), put(&b, L[i].key + p, strlen(L[i].key + p));
 		text(&b, "p"), head(&b, 0, p);
 		text(&b, "t");
-		if (j > i + 1) mst_node(L, i + 1, j, layer - 1, car, sub), cid_put(&b, sub);
+		if (j > i + 1) mst_node(x, i + 1, j, layer - 1, sub), cid_put(&b, sub);
 		else put(&b, "\xf6", 1);
 		text(&b, "v"), cid_put(&b, L[i].cid);
 		prev = L[i].key, i = j;
@@ -450,13 +456,17 @@ static void mst_node(const leaf *L, size_t lo, size_t hi, int layer, buf *car, u
 	text(&b, "l");
 	if (has_left) cid_put(&b, left);
 	else put(&b, "\xf6", 1);
-	emit(car, &b, cid);
+	/* inclusive bounds: when the key is present, also take the spines of its
+	 * neighbouring subtrees, which deleting it would merge */
+	int on_path = !x->key || ((lo == 0 || strcmp(L[lo - 1].key, x->key) <= 0) &&
+	                          (hi == x->n || strcmp(x->key, L[hi].key) <= 0));
+	emit(on_path ? x->car : NULL, &b, cid);
 	free(b.p);
 }
 
 /* ponytail: rebuilds the whole MST from the record table on every write and
  * export, O(records). Persist nodes and update incrementally if repos get big. */
-static void mst_root(const char *did, buf *car, unsigned char root[36]) {
+static void mst_root(const char *did, buf *car, const char *key, unsigned char root[36]) {
 	sqlite3_stmt *s = q("SELECT collection||'/'||rkey, cid FROM record WHERE did=? ORDER BY 1", 1, did);
 	leaf *L = NULL;
 	size_t n = 0, cap = 0;
@@ -469,7 +479,8 @@ static void mst_root(const char *did, buf *car, unsigned char root[36]) {
 		n++;
 	}
 	sqlite3_finalize(s);
-	mst_node(L, 0, n, top, car, root);
+	mst_ctx x = {L, n, car, key};
+	mst_node(&x, 0, n, top, root);
 	while (n) free(L[--n].key);
 	free(L);
 }
@@ -486,19 +497,20 @@ static void commit_cbor(buf *b, const char *did, const char *rev, const unsigned
 
 /* Signs a commit over the repo's current records and makes it the head.
  * Call inside the transaction that changed the records. */
-static int new_commit(const char *did, char cid_out[64], char rev[14]) {
+/* Also appends the new MST nodes and the commit block to `blocks` if given. */
+static int new_commit(const char *did, buf *blocks, char cid_out[64], char rev[14]) {
 	unsigned char root[36], sig[64], cid[36];
 	buf u = {0}, sgn = {0};
 	sqlite3_stmt *s = q("SELECT key FROM account WHERE did=?", 1, did);
 	EVP_PKEY *k = sqlite3_step(s) == SQLITE_ROW ? load_key((const char *)sqlite3_column_text(s, 0)) : NULL;
 	sqlite3_finalize(s);
-	mst_root(did, NULL, root);
+	mst_root(did, blocks, NULL, root);
 	tid(rev);
 	commit_cbor(&u, did, rev, root, NULL);
 	int rc = !k || sign(k, &u, sig) ? -1 : 0;
 	if (!rc) {
 		commit_cbor(&sgn, did, rev, root, sig);
-		cid_of(&sgn, cid);
+		emit(blocks, &sgn, cid);
 		cid_str(cid, cid_out);
 		s = q("UPDATE account SET head=?, rev=?, head_block=?3 WHERE did=?4", 2, cid_out, rev);
 		sqlite3_bind_blob(s, 3, sgn.p, (int)sgn.n, SQLITE_TRANSIENT);
@@ -508,6 +520,216 @@ static int new_commit(const char *did, char cid_out[64], char rev[14]) {
 	EVP_PKEY_free(k);
 	free(u.p), free(sgn.p);
 	return rc;
+}
+
+/* ---------- firehose (com.atproto.sync.subscribeRepos) ---------- */
+
+static void car_header(buf *car, const unsigned char root[36]) {
+	buf h = {0};
+	head(&h, 5, 2);
+	text(&h, "roots"), head(&h, 4, 1), cid_put(&h, root);
+	text(&h, "version"), head(&h, 0, 1);
+	varint(car, h.n);
+	put(car, h.p, h.n);
+	free(h.p);
+}
+
+static int cid_cmp(const void *a, const void *b) { return memcmp(a, b, 36); }
+
+/* Appends to `to` every CAR-framed block of `from` whose CID isn't in `old`. */
+static void car_diff(buf *to, const buf *from, const buf *old) {
+	unsigned char *seen = NULL;
+	size_t n = 0;
+	for (int pass = 0; pass < 2; pass++) {
+		const buf *src = pass ? from : old;
+		for (size_t i = 0; i < src->n;) {
+			uint64_t len = 0;
+			for (int sh = 0;; sh += 7) {
+				unsigned char c = src->p[i++];
+				len |= (uint64_t)(c & 0x7f) << sh;
+				if (!(c & 0x80)) break;
+			}
+			const unsigned char *cid = src->p + i;
+			if (!pass) {
+				seen = realloc(seen, 36 * (n + 1));
+				memcpy(seen + 36 * n++, cid, 36);
+			} else if (!bsearch(cid, seen, n, 36, cid_cmp)) {
+				varint(to, len);
+				put(to, cid, len);
+			}
+			i += len;
+		}
+		if (!pass) qsort(seen, n, 36, cid_cmp);
+	}
+	free(seen);
+}
+
+static void now_iso(char out[32]) {
+	struct timespec ts;
+	struct tm tm;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	gmtime_r(&ts.tv_sec, &tm);
+	size_t n = strftime(out, 32, "%Y-%m-%dT%H:%M:%S", &tm);
+	snprintf(out + n, 32 - n, ".%03ldZ", ts.tv_nsec / 1000000);
+}
+
+/* Event frames are stored whole (header + body) under their seq. */
+static long long event_begin(const char *did, buf *f, const char *type) {
+	if (exec1(q("INSERT INTO event(did) VALUES(?)", 1, did))) return -1;
+	head(f, 5, 2);
+	text(f, "t"), text(f, type);
+	text(f, "op"), head(f, 0, 1);
+	return sqlite3_last_insert_rowid(db);
+}
+
+static int event_end(long long seq, buf *f) {
+	sqlite3_stmt *s = q("UPDATE event SET frame=?1 WHERE seq=?2", 0);
+	sqlite3_bind_blob(s, 1, f->p, (int)f->n, SQLITE_TRANSIENT);
+	sqlite3_bind_int64(s, 2, seq);
+	free(f->p);
+	return exec1(s);
+}
+
+typedef struct { const char *action, *path; const unsigned char *cid, *prev; } repo_op;
+
+/* #commit: blocks are the CAR-framed diff (commit, new MST nodes, new records). */
+static int commit_event(const char *did, const char *since, const unsigned char *prev_data, const char *ccid,
+                        const char *rev, const buf *blocks, const repo_op *ops, int nops) {
+	buf f = {0}, car = {0};
+	unsigned char cc[36];
+	char t[32];
+	long long seq = event_begin(did, &f, "#commit");
+	if (seq < 0) return -1;
+	cid_parse(ccid, cc);
+	car_header(&car, cc);
+	put(&car, blocks->p, blocks->n);
+	now_iso(t);
+	head(&f, 5, prev_data ? 12 : 11); /* keys in dag-cbor order: length, then bytes */
+	text(&f, "ops"), head(&f, 4, (uint64_t)nops);
+	for (int i = 0; i < nops; i++) {
+		head(&f, 5, ops[i].prev ? 4 : 3);
+		text(&f, "cid");
+		if (ops[i].cid) cid_put(&f, ops[i].cid);
+		else put(&f, "\xf6", 1);
+		text(&f, "path"), text(&f, ops[i].path);
+		if (ops[i].prev) text(&f, "prev"), cid_put(&f, ops[i].prev);
+		text(&f, "action"), text(&f, ops[i].action);
+	}
+	text(&f, "rev"), text(&f, rev);
+	text(&f, "seq"), head(&f, 0, (uint64_t)seq);
+	text(&f, "repo"), text(&f, did);
+	text(&f, "time"), text(&f, t);
+	text(&f, "blobs"), head(&f, 4, 0);
+	text(&f, "since");
+	if (since && *since) text(&f, since);
+	else put(&f, "\xf6", 1);
+	text(&f, "blocks"), head(&f, 2, car.n), put(&f, car.p, car.n);
+	text(&f, "commit"), cid_put(&f, cc);
+	text(&f, "rebase"), put(&f, "\xf4", 1);
+	text(&f, "tooBig"), put(&f, "\xf4", 1);
+	if (prev_data) text(&f, "prevData"), cid_put(&f, prev_data);
+	free(car.p);
+	return event_end(seq, &f);
+}
+
+/* #identity then #account, announced when an account is created. */
+static int account_events(const char *did, const char *handle) {
+	char t[32];
+	now_iso(t);
+	for (int i = 0; i < 2; i++) {
+		buf f = {0};
+		long long seq = event_begin(did, &f, i ? "#account" : "#identity");
+		if (seq < 0) return -1;
+		head(&f, 5, 4);
+		text(&f, "did"), text(&f, did);
+		text(&f, "seq"), head(&f, 0, (uint64_t)seq);
+		text(&f, "time"), text(&f, t);
+		if (i) text(&f, "active"), put(&f, "\xf5", 1);
+		else text(&f, "handle"), text(&f, handle);
+		if (event_end(seq, &f)) return -1;
+	}
+	return 0;
+}
+
+#define MAX_SUBS 256
+static struct { MHD_socket fd; struct MHD_UpgradeResponseHandle *urh; } subs[MAX_SUBS];
+static int nsubs;
+static long long sent_seq; /* highest seq pushed to live subscribers */
+
+static int send_all(MHD_socket fd, const void *p, size_t n) {
+	for (ssize_t w; n; p = (const char *)p + w, n -= (size_t)w)
+		if ((w = send(fd, p, n, 0)) <= 0) return -1;
+	return 0;
+}
+
+static int ws_send(MHD_socket fd, const void *p, size_t n) {
+	unsigned char h[10] = {0x82}; /* FIN + binary */
+	size_t hl = 2;
+	if (n < 126) h[1] = (unsigned char)n;
+	else if (n < 65536) h[1] = 126, h[2] = (unsigned char)(n >> 8), h[3] = (unsigned char)n, hl = 4;
+	else {
+		h[1] = 127, hl = 10;
+		for (int i = 0; i < 8; i++) h[2 + i] = (unsigned char)((uint64_t)n >> (56 - 8 * i));
+	}
+	return send_all(fd, h, hl) || send_all(fd, p, n);
+}
+
+/* Pushes events committed since the last call to every subscriber. */
+static void broadcast(void) {
+	sqlite3_stmt *s = q("SELECT seq, frame FROM event WHERE seq>?1 ORDER BY seq", 0);
+	sqlite3_bind_int64(s, 1, sent_seq);
+	while (sqlite3_step(s) == SQLITE_ROW) {
+		sent_seq = sqlite3_column_int64(s, 0);
+		for (int i = 0; i < nsubs; i++)
+			if (ws_send(subs[i].fd, sqlite3_column_blob(s, 1), (size_t)sqlite3_column_bytes(s, 1))) {
+				MHD_upgrade_action(subs[i].urh, MHD_UPGRADE_ACTION_CLOSE);
+				subs[i--] = subs[--nsubs];
+			}
+	}
+	sqlite3_finalize(s);
+}
+
+/* ponytail: sends are blocking with a 5s timeout on the single server thread,
+ * so one stuck subscriber can stall everyone briefly, and incoming frames
+ * (ping/close) are never read. Move to per-subscriber queues + poll if needed. */
+static void on_upgrade(void *cls, struct MHD_Connection *c, void *req_cls, const char *extra, size_t extra_n,
+                       MHD_socket fd, struct MHD_UpgradeResponseHandle *urh) {
+	(void)c, (void)req_cls, (void)extra, (void)extra_n;
+	long long cursor = (long long)(intptr_t)cls - 1;
+	struct timeval tv = {5, 0};
+	int one = 1;
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+	if (nsubs == MAX_SUBS) {
+		MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+		return;
+	}
+	if (cursor > sent_seq) {
+		buf f = {0};
+		head(&f, 5, 1), text(&f, "op"), head(&f, 1, 0); /* op: -1 */
+		head(&f, 5, 2), text(&f, "error"), text(&f, "FutureCursor");
+		text(&f, "message"), text(&f, "cursor is ahead of the stream");
+		ws_send(fd, f.p, f.n);
+		free(f.p);
+		MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+		return;
+	}
+	if (cursor >= 0) { /* backfill; events are kept forever */
+		sqlite3_stmt *s = q("SELECT frame FROM event WHERE seq>?1 AND seq<=?2 ORDER BY seq", 0);
+		sqlite3_bind_int64(s, 1, cursor);
+		sqlite3_bind_int64(s, 2, sent_seq);
+		int bad = 0;
+		while (!bad && sqlite3_step(s) == SQLITE_ROW)
+			bad = ws_send(fd, sqlite3_column_blob(s, 0), (size_t)sqlite3_column_bytes(s, 0));
+		sqlite3_finalize(s);
+		if (bad) {
+			MHD_upgrade_action(urh, MHD_UPGRADE_ACTION_CLOSE);
+			return;
+		}
+	}
+	subs[nsubs].fd = fd;
+	subs[nsubs++].urh = urh;
 }
 
 /* ---------- validation ---------- */
@@ -653,13 +875,16 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 	EVP_PKEY *k = pem ? load_key(pem) : NULL;
 	int rc = !k || pub_multikey(k, a.pubkey);
 	EVP_PKEY_free(k);
+	buf blocks = {0};
 	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
 	rc = rc ||
 	     exec1(q("INSERT INTO account(did,handle,email,salt,hash,key,pubkey) VALUES(?,?,?,?,?,?,?)", 7, a.did,
 	             a.handle, email, a.salt, a.hash, pem, a.pubkey)) ||
-	     new_commit(a.did, a.head, a.rev); /* empty repo */
+	     new_commit(a.did, &blocks, a.head, a.rev) || /* empty repo */
+	     account_events(a.did, a.handle) || commit_event(a.did, NULL, NULL, a.head, a.rev, &blocks, NULL, 0);
 	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
-	free(pem);
+	free(pem), free(blocks.p);
+	broadcast();
 	if (rc) return err(c, 500, "InternalServerError", "could not create account");
 	return session(c, &a);
 }
@@ -843,10 +1068,11 @@ static res repo_write(struct MHD_Connection *c, cJSON *b, int op) {
 	    (cJSON_IsNull(swap) ? exists : !cJSON_IsString(swap) || !exists || strcmp(swap->valuestring, cur)))
 		return err(c, 400, "InvalidSwap", "record was at a different version");
 
-	char *json = NULL, ccid[64], rev[14];
+	char *json = NULL, ccid[64], rev[14], path[1024];
+	cJSON *rec = NULL;
 	if (op == CREATE && exists) return err(c, 400, "InvalidRequest", "record already exists");
 	if (op != DELETE) {
-		cJSON *rec = cJSON_GetObjectItemCaseSensitive(b, "record");
+		rec = cJSON_GetObjectItemCaseSensitive(b, "record");
 		if (!cJSON_IsObject(rec)) return err(c, 400, "InvalidRequest", "record must be an object");
 		cJSON *type = cJSON_GetObjectItemCaseSensitive(rec, "$type");
 		if (!type) cJSON_AddStringToObject(rec, "$type", col);
@@ -856,14 +1082,37 @@ static res repo_write(struct MHD_Connection *c, cJSON *b, int op) {
 		json = cJSON_PrintUnformatted(rec);
 	}
 
+	buf old = {0}, now = {0}, diff = {0};
+	unsigned char prev_data[36], proof_root[36], new_cid[36], old_cid[36];
 	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+	mst_root(did, &old, NULL, prev_data);
 	int rc = exec1(op == DELETE ? q("DELETE FROM record WHERE did=? AND collection=? AND rkey=?", 3, did, col, rkey)
 	                            : q("INSERT OR REPLACE INTO record(did,collection,rkey,cid,value) VALUES(?,?,?,?,?)",
 	                                5, did, col, rkey, cid, json));
 	int changed = !rc && sqlite3_changes(db) > 0;
-	if (changed) rc = new_commit(did, ccid, rev);
+	if (changed) rc = new_commit(did, &now, ccid, rev);
+	if (changed && !rc) {
+		/* ops must be invertible from the event alone (sync 1.1): send the new
+		 * nodes plus the key's search path, which may reuse unchanged nodes */
+		buf proof = {0};
+		snprintf(path, sizeof path, "%s/%s", col, rkey);
+		mst_root(did, &proof, path, proof_root);
+		car_diff(&diff, &now, &old);
+		car_diff(&diff, &proof, &diff);
+		free(proof.p);
+		if (rec) {
+			buf rb = {0};
+			cbor(&rb, rec);
+			emit(&diff, &rb, new_cid);
+			free(rb.p);
+		}
+		repo_op o = {op == DELETE ? "delete" : exists ? "update" : "create", path, rec ? new_cid : NULL,
+		             exists && !cid_parse(cur, old_cid) ? old_cid : NULL};
+		rc = commit_event(did, a.rev, prev_data, ccid, rev, &diff, &o, 1);
+	}
 	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
-	free(json);
+	free(json), free(old.p), free(now.p), free(diff.p);
+	broadcast();
 	if (rc) return err(c, 500, "InternalServerError", "write failed");
 
 	cJSON *o = op == DELETE ? cJSON_CreateObject() : record_view(did, col, rkey, cid, NULL);
@@ -936,19 +1185,15 @@ static res get_repo(struct MHD_Connection *c, cJSON *b) {
 	(void)b;
 	account a;
 	if (did_arg(c, &a)) return err(c, 400, "RepoNotFound", "could not find repo for DID");
-	buf car = {0}, hdr = {0}, blk = {0};
+	buf car = {0}, blk = {0};
 	unsigned char cid[36];
 	sqlite3_stmt *s = q("SELECT head_block FROM account WHERE did=?", 1, a.did);
 	if (sqlite3_step(s) == SQLITE_ROW) put(&blk, sqlite3_column_blob(s, 0), (size_t)sqlite3_column_bytes(s, 0));
 	sqlite3_finalize(s);
 	cid_of(&blk, cid);
-	head(&hdr, 5, 2);
-	text(&hdr, "roots"), head(&hdr, 4, 1), cid_put(&hdr, cid);
-	text(&hdr, "version"), head(&hdr, 0, 1);
-	varint(&car, hdr.n);
-	put(&car, hdr.p, hdr.n);
+	car_header(&car, cid);
 	emit(&car, &blk, cid);
-	mst_root(a.did, &car, cid);
+	mst_root(a.did, &car, NULL, cid);
 	s = q("SELECT value FROM record WHERE did=?", 1, a.did);
 	while (sqlite3_step(s) == SQLITE_ROW) {
 		cJSON *v = cJSON_Parse((const char *)sqlite3_column_text(s, 0));
@@ -958,8 +1203,30 @@ static res get_repo(struct MHD_Connection *c, cJSON *b) {
 		emit(&car, &blk, cid);
 	}
 	sqlite3_finalize(s);
-	free(hdr.p), free(blk.p);
+	free(blk.p);
 	return send_raw(c, 200, "application/vnd.ipld.car", car.p, car.n);
+}
+
+static res subscribe_repos(struct MHD_Connection *c, cJSON *b) {
+	(void)b;
+	const char *key = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Sec-WebSocket-Key"),
+	           *up = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Upgrade"), *cur = ARG("cursor");
+	if (!key || strlen(key) > 64 || !up || strcasecmp(up, "websocket"))
+		return err(c, 400, "InvalidRequest", "websocket upgrade required");
+	char *end;
+	long long cursor = cur ? strtoll(cur, &end, 10) : -1;
+	if (cur && (*end || cursor < 0)) return err(c, 400, "InvalidRequest", "invalid cursor");
+	char in[128], accept[32];
+	unsigned char h[20];
+	snprintf(in, sizeof in, "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
+	SHA1((unsigned char *)in, strlen(in), h);
+	EVP_EncodeBlock((unsigned char *)accept, h, sizeof h);
+	struct MHD_Response *r = MHD_create_response_for_upgrade(on_upgrade, (void *)(intptr_t)(cursor + 1));
+	MHD_add_response_header(r, "Upgrade", "websocket");
+	MHD_add_response_header(r, "Sec-WebSocket-Accept", accept);
+	res ret = MHD_queue_response(c, MHD_HTTP_SWITCHING_PROTOCOLS, r);
+	MHD_destroy_response(r);
+	return ret;
 }
 
 static const struct {
@@ -985,6 +1252,7 @@ static const struct {
     {"/xrpc/com.atproto.sync.getLatestCommit", 0, get_latest_commit},
     {"/xrpc/com.atproto.sync.getRepoStatus", 0, get_repo_status},
     {"/xrpc/com.atproto.sync.listRepos", 0, list_repos},
+    {"/xrpc/com.atproto.sync.subscribeRepos", 0, subscribe_repos},
 };
 
 /* Handle → DID over HTTPS: GET /.well-known/atproto-did with Host: <handle>. */
@@ -1075,16 +1343,23 @@ int main(void) {
 	                 " pubkey TEXT NOT NULL, head TEXT, rev TEXT, head_block BLOB);"
 	                 "CREATE TABLE IF NOT EXISTS record(did TEXT NOT NULL, collection TEXT NOT NULL,"
 	                 " rkey TEXT NOT NULL, cid TEXT NOT NULL, value TEXT NOT NULL,"
-	                 " PRIMARY KEY(did, collection, rkey));",
+	                 " PRIMARY KEY(did, collection, rkey));"
+	                 "CREATE TABLE IF NOT EXISTS event(seq INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT NOT NULL,"
+	                 " frame BLOB);",
 	                 NULL, NULL, NULL)) {
 		fprintf(stderr, "db: %s\n", sqlite3_errmsg(db));
 		return 1;
 	}
+	sqlite3_stmt *s = q("SELECT ifnull(max(seq), 0) FROM event", 0);
+	sqlite3_step(s);
+	sent_seq = sqlite3_column_int64(s, 0);
+	sqlite3_finalize(s);
 
 	/* ponytail: one polling thread serializes all requests (and sqlite access);
 	 * switch to a thread pool + per-thread connections if load demands it. */
-	struct MHD_Daemon *d = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG, (uint16_t)port, NULL,
-	                                        NULL, handler, NULL, MHD_OPTION_NOTIFY_COMPLETED, done, NULL,
+	struct MHD_Daemon *d = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG | MHD_ALLOW_UPGRADE,
+	                                        (uint16_t)port, NULL, NULL, handler, NULL, MHD_OPTION_NOTIFY_COMPLETED,
+	                                        done, NULL,
 	                                        MHD_OPTION_END);
 	if (!d) {
 		fprintf(stderr, "cannot listen on port %d\n", port);

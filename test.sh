@@ -61,5 +61,10 @@ H2=$(get "com.atproto.sync.getLatestCommit?did=$DID" | field cid)
 get "com.atproto.sync.listRepos" | grep -q "\"head\":\"$H2\"" || fail listRepos
 curl -s -D - -o /dev/null "$U/com.atproto.sync.getRepo?did=$DID" | grep -qi 'content-type: application/vnd.ipld.car' || fail getRepo
 get "com.atproto.repo.describeRepo?repo=$DID" | grep -q '"publicKeyMultibase":"zQ3s' || fail didDoc key
-get com.atproto.sync.subscribeRepos | grep -q MethodNotImplemented || fail 501
+# firehose handshake (RFC 6455 sample key -> known accept value)
+curl -s -i --max-time 1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$U/com.atproto.sync.subscribeRepos?cursor=0" 2>/dev/null |
+  grep -q 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=' || fail subscribeRepos
+get com.atproto.sync.subscribeRepos | grep -q 'websocket upgrade required' || fail subscribeRepos-plain
+get com.atproto.admin.getAccountInfo | grep -q MethodNotImplemented || fail 501
 echo "all tests passed"
