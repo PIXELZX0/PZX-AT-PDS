@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 
 #include <cjson/cJSON.h>
@@ -45,7 +46,7 @@ static const char *appview_url, *appview_did;
 static pthread_mutex_t big;
 static char endpoint[300], service_did[300];
 static unsigned char jwt_secret[32];
-static int invite_required;
+static int invite_required, trust_proxy;
 static char admin_basic[400]; /* expected "Basic <base64(admin:password)>", empty: admin disabled */
 
 /* ---------- encoding helpers ---------- */
@@ -1111,6 +1112,48 @@ static res put_prefs(struct MHD_Connection *c, cJSON *b) {
 	return rc ? err(c, 500, "InternalServerError", "write failed") : send_body(c, 200, "application/json", strdup("{}"));
 }
 
+/* ---------- abuse limits ---------- */
+
+/* ponytail: fixed windows in a hashed in-memory counter table; colliding keys
+ * share a budget (errs toward limiting) and counts reset on restart. Use a
+ * shared store if this ever runs as several processes. */
+#define RL_SLOTS 4096
+static struct { time_t start; int n; } rl[RL_SLOTS];
+static uint64_t rl_seed;
+
+/* Counts one attempt for kind+key; true once more than max in window seconds. */
+static int rate_limited(const char *kind, const char *key, int max, int window) {
+	uint64_t h = 1469598103934665603ULL ^ rl_seed;
+	for (const char *p = kind; *p; p++) h = (h ^ (unsigned char)*p) * 1099511628211ULL;
+	h = (h ^ ':') * 1099511628211ULL;
+	for (const char *p = key; *p; p++) h = (h ^ (unsigned char)tolower((unsigned char)*p)) * 1099511628211ULL;
+	time_t now = time(NULL);
+	if (now - rl[h % RL_SLOTS].start >= window) rl[h % RL_SLOTS].start = now, rl[h % RL_SLOTS].n = 0;
+	return ++rl[h % RL_SLOTS].n > max;
+}
+
+/* Socket peer, or with PDS_TRUST_PROXY the address our reverse proxy saw
+ * (the last X-Forwarded-For entry, the one the proxy appended). */
+static void client_ip(struct MHD_Connection *c, char out[64]) {
+	const char *xff = trust_proxy ? MHD_lookup_connection_value(c, MHD_HEADER_KIND, "X-Forwarded-For") : NULL;
+	if (xff) {
+		const char *last = strrchr(xff, ',');
+		last = last ? last + 1 : xff;
+		while (*last == ' ') last++;
+		snprintf(out, 64, "%s", last);
+		return;
+	}
+	const union MHD_ConnectionInfo *ci = MHD_get_connection_info(c, MHD_CONNECTION_INFO_CLIENT_ADDRESS);
+	const struct sockaddr *sa = ci ? ci->client_addr : NULL;
+	strcpy(out, "?");
+	if (sa && sa->sa_family == AF_INET) inet_ntop(AF_INET, &((const struct sockaddr_in *)sa)->sin_addr, out, 64);
+	if (sa && sa->sa_family == AF_INET6) inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)sa)->sin6_addr, out, 64);
+}
+
+static res too_many(struct MHD_Connection *c) {
+	return err(c, 429, "RateLimitExceeded", "too many attempts, try again later");
+}
+
 /* ---------- XRPC handlers ---------- */
 
 static res health(struct MHD_Connection *c, cJSON *b) {
@@ -1133,6 +1176,9 @@ static res describe_server(struct MHD_Connection *c, cJSON *b) {
 }
 
 static res create_account(struct MHD_Connection *c, cJSON *b) {
+	char ip[64];
+	client_ip(c, ip);
+	if (rate_limited("signup-ip", ip, 10, 3600)) return too_many(c);
 	const char *h = str(b, "handle"), *pw = str(b, "password"), *email = str(b, "email");
 	if (!h || !pw || !*pw) return err(c, 400, "InvalidRequest", "handle and password are required");
 	char handle[256];
@@ -1212,7 +1258,10 @@ static res create_invite_code(struct MHD_Connection *c, cJSON *b) {
 static res create_session(struct MHD_Connection *c, cJSON *b) {
 	const char *id = str(b, "identifier"), *pw = str(b, "password");
 	account a;
-	char h[65];
+	char h[65], ip[64];
+	client_ip(c, ip);
+	/* per IP stops spraying, per identifier stops guessing one account's password */
+	if (rate_limited("login-ip", ip, 30, 300) | rate_limited("login-id", id ? id : "", 10, 300)) return too_many(c);
 	if (!id || !pw || find_account(id, 1, &a)) {
 		hash_pw("x", "timing", h); /* keep unknown-user path as slow as a real check */
 		return err(c, 401, "AuthenticationRequired", "Invalid identifier or password");
@@ -1356,6 +1405,18 @@ static res update_handle(struct MHD_Connection *c, cJSON *b) {
 	broadcast();
 	return rc ? err(c, 500, "InternalServerError", "could not update handle")
 	          : send_body(c, 200, "application/json", strdup("{}"));
+}
+
+/* Caddy on_demand_tls "ask" hook: only issue certificates for this host and
+ * for handles of accounts that live here. */
+static res tls_check(struct MHD_Connection *c) {
+	const char *d = ARG("domain");
+	char dom[256];
+	account a;
+	snprintf(dom, sizeof dom, "%s", d ? d : "");
+	for (char *p = dom; *p; p++) *p = (char)tolower((unsigned char)*p);
+	int ok = *dom && (!strcmp(dom, hostname) || (strncmp(dom, "did:", 4) && !find_account(dom, 0, &a)));
+	return send_body(c, ok ? 200 : 404, "text/plain", strdup(ok ? "ok" : "unknown domain"));
 }
 
 /* The PDS's own did:web document. */
@@ -1855,7 +1916,8 @@ static res handler(void *cls, struct MHD_Connection *c, const char *url, const c
 	if (bd->too_big && strcmp(url, "/xrpc/com.atproto.repo.uploadBlob"))
 		return err(c, 413, "PayloadTooLarge", "request body too large");
 	const char *nsid = !strncmp(url, "/xrpc/", 6) ? url + 6 : "";
-	int known = !strncmp(url, "/.well-known/", 13) || !strcmp(nsid, "com.atproto.repo.uploadBlob");
+	int known = !strncmp(url, "/.well-known/", 13) || !strcmp(url, "/tls-check") ||
+	            !strcmp(nsid, "com.atproto.repo.uploadBlob");
 	for (size_t i = 0; i < sizeof routes / sizeof *routes; i++) known |= !strcmp(url, routes[i].path);
 	if (!known && valid_nsid(nsid) &&
 	    (!strncmp(nsid, "app.bsky.", 9) || MHD_lookup_connection_value(c, MHD_HEADER_KIND, "atproto-proxy")))
@@ -1869,6 +1931,7 @@ static res handler(void *cls, struct MHD_Connection *c, const char *url, const c
 static res dispatch(struct MHD_Connection *c, const char *url, const char *method, body *bd) {
 	if (!strcmp(url, "/.well-known/atproto-did")) return well_known_did(c);
 	if (!strcmp(url, "/.well-known/did.json")) return service_did_doc(c);
+	if (!strcmp(url, "/tls-check")) return tls_check(c);
 	if (!strcmp(url, "/xrpc/com.atproto.repo.uploadBlob"))
 		return strcmp(method, "POST") ? err(c, 405, "InvalidRequest", "wrong HTTP method") : upload_blob(c, bd);
 	for (size_t i = 0; i < sizeof routes / sizeof *routes; i++) {
@@ -1906,6 +1969,8 @@ int main(void) {
 	hostname = env("PDS_HOSTNAME", "localhost");
 	int port = atoi(env("PDS_PORT", "2583"));
 	invite_required = strcmp(env("PDS_INVITE_REQUIRED", "true"), "false") != 0;
+	trust_proxy = !strcmp(env("PDS_TRUST_PROXY", "false"), "true");
+	RAND_bytes((unsigned char *)&rl_seed, sizeof rl_seed);
 	const char *admin_pw = getenv("PDS_ADMIN_PASSWORD");
 	if (admin_pw && *admin_pw) {
 		char userpass[300], *enc = admin_basic + 6;

@@ -101,4 +101,12 @@ curl -s -i --max-time 1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec
   grep -q 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=' || fail subscribeRepos
 get com.atproto.sync.subscribeRepos | grep -q 'websocket upgrade required' || fail subscribeRepos-plain
 get com.atproto.admin.getAccountInfo | grep -q MethodNotImplemented || fail 501
+# Caddy on-demand TLS ask hook
+curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/tls-check?domain=localhost" | grep -q 200 || fail tls-host
+curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/tls-check?domain=Alice.localhost" | grep -q 200 || fail tls-handle
+curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/tls-check?domain=evil.example" | grep -q 404 || fail tls-other
+
+# login attempts per identifier are capped (10 per 5 min)
+for i in $(seq 10); do TOK= post com.atproto.server.createSession '{"identifier":"nobody.localhost","password":"x"}' >/dev/null; done
+TOK= post com.atproto.server.createSession '{"identifier":"nobody.localhost","password":"x"}' | grep -q RateLimitExceeded || fail ratelimit
 echo "all tests passed"
