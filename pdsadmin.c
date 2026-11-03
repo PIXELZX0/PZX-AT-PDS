@@ -244,6 +244,15 @@ static void request_crawl(int argc, char **argv) {
 	puts("done");
 }
 
+/* Re-publishes every account's _atproto.<handle> TXT record (PDS_DNS_PROVIDER). */
+static void dns_sync(void) {
+	cJSON *b = cJSON_CreateObject(), *r = xrpc("com.pzx.admin.syncDns", NULL, b, 1);
+	cJSON *n = cJSON_GetObjectItem(r, "queued");
+	printf("Queued %d handle(s) for DNS sync via %s; progress is in the pds log.\n",
+	       cJSON_IsNumber(n) ? n->valueint : 0, s(r, "provider"));
+	cJSON_Delete(r), cJSON_Delete(b);
+}
+
 static void usage(void) {
 	puts("pdsadmin help\n"
 	     "---\n"
@@ -275,6 +284,10 @@ static void usage(void) {
 	     "    Request a crawl from a relay host.\n"
 	     "    e.g. pdsadmin request-crawl bsky.network\n"
 	     "\n"
+	     "dns-sync\n"
+	     "    Re-publish every handle's _atproto TXT record (needs PDS_DNS_PROVIDER).\n"
+	     "    e.g. pdsadmin dns-sync\n"
+	     "\n"
 	     "create-invite-code\n"
 	     "  Create a new invite code.\n"
 	     "    e.g. pdsadmin create-invite-code\n"
@@ -301,6 +314,8 @@ int main(int argc, char **argv) {
 		cJSON *r = invite_code();
 		puts(s(r, "code"));
 		cJSON_Delete(r);
+	} else if (!strcmp(cmd, "dns-sync")) {
+		dns_sync();
 	} else if (!strcmp(cmd, "request-crawl")) {
 		request_crawl(argc, argv);
 	} else if (!strcmp(cmd, "account") && !strcmp(sub, "list")) {

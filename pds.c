@@ -5,6 +5,8 @@
  * the account's secp256k1 key; com.atproto.sync.getRepo exports it as a CAR
  * and subscribeRepos streams commits. DIDs are did:plc, registered with the
  * PLC directory, and relays are asked to crawl (both off on localhost).
+ * Optionally, handle DIDs are published as _atproto TXT records through a DNS
+ * provider API (Cloudflare, or a webhook for anything else).
  */
 #include <ctype.h>
 #include <math.h>
@@ -13,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <pthread.h>
 #include <signal.h>
@@ -50,6 +53,11 @@ static char endpoint[300], service_did[300];
 static unsigned char jwt_secret[32];
 static int invite_required, trust_proxy, require_email_confirmed;
 static char admin_basic[400]; /* expected "Basic <base64(admin:password)>", empty: admin disabled */
+
+static const char *env(const char *k, const char *def) {
+	const char *v = getenv(k);
+	return v && *v ? v : def;
+}
 
 /* ---------- encoding helpers ---------- */
 
@@ -780,13 +788,16 @@ static size_t collect(char *p, size_t size, size_t n, void *u) {
 	return size * n;
 }
 
-/* POSTs when body is non-NULL. Returns the HTTP status, 0 if unreachable. */
-static long http(const char *url, struct curl_slist *hdrs, const void *body, size_t n, buf *out, char ctype[128]) {
+/* method NULL: POST when body is non-NULL, else GET. Returns the HTTP status,
+ * 0 if unreachable. */
+static long http_req(const char *method, const char *url, struct curl_slist *hdrs, const void *body, size_t n,
+                     buf *out, char ctype[128]) {
 	CURL *c = curl_easy_init();
 	long code = 0;
 	char *ct = NULL;
 	if (!c) return 0;
 	curl_easy_setopt(c, CURLOPT_URL, url);
+	if (method) curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method);
 	curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
 	curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
 	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, collect);
@@ -802,6 +813,10 @@ static long http(const char *url, struct curl_slist *hdrs, const void *body, siz
 	}
 	curl_easy_cleanup(c);
 	return code;
+}
+
+static long http(const char *url, struct curl_slist *hdrs, const void *body, size_t n, buf *out, char ctype[128]) {
+	return http_req(NULL, url, hdrs, body, n, out, ctype);
 }
 
 /* ponytail: synchronous, holding the global lock (30s timeout). Fine for
@@ -1208,6 +1223,221 @@ static res too_many(struct MHD_Connection *c) {
 	return err(c, 429, "RateLimitExceeded", "too many attempts, try again later");
 }
 
+/* ---------- DNS: publish _atproto.<handle> TXT "did=<did>" ---------- */
+
+/* With PDS_DNS_PROVIDER set, each handle of the form <name>.<hostname> gets a
+ * TXT record _atproto.<handle> = "did=<did>", so it also resolves over DNS and
+ * not only via /.well-known/atproto-did. Providers:
+ *   cloudflare  PDS_CLOUDFLARE_API_TOKEN (permission Zone > DNS > Edit), and
+ *               PDS_CLOUDFLARE_ZONE_ID, else the zone is found from the hostname
+ *   webhook     PDS_DNS_WEBHOOK_URL gets a JSON POST per change (bearer
+ *               PDS_DNS_WEBHOOK_TOKEN if set); bridge it to any other DNS host
+ * Jobs run on one background thread and only name a handle: the worker makes
+ * DNS match whatever the database says at that moment, so jobs are idempotent
+ * and their order doesn't matter. Only TXT values starting with "did=" are
+ * touched. Failures are logged; com.pzx.admin.syncDns (pdsadmin dns-sync)
+ * re-queues every account. */
+static const char *dns_provider, *cf_api, *cf_token, *dns_webhook, *dns_webhook_token;
+static char cf_zone[64];
+typedef struct dns_job {
+	struct dns_job *next;
+	char handle[256];
+} dns_job;
+static dns_job *dns_head, **dns_tail = &dns_head;
+static pthread_mutex_t dns_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dns_cv = PTHREAD_COND_INITIALIZER;
+
+static int dns_managed(const char *handle) {
+	return dns_provider && valid_handle(handle);
+}
+
+static void dns_queue(const char *handle) {
+	dns_job *j;
+	if (!dns_managed(handle) || !(j = calloc(1, sizeof *j))) return;
+	snprintf(j->handle, sizeof j->handle, "%s", handle);
+	pthread_mutex_lock(&dns_mu);
+	*dns_tail = j, dns_tail = &j->next;
+	pthread_cond_signal(&dns_cv);
+	pthread_mutex_unlock(&dns_mu);
+}
+
+/* TXT values come back quoted ("did=...") from most APIs; strip that. */
+static void txt_unquote(const char *in, char *out, size_t n) {
+	size_t l = strlen(in);
+	if (l >= 2 && in[0] == '"' && in[l - 1] == '"') in++, l -= 2;
+	snprintf(out, n, "%.*s", (int)l, in);
+}
+
+/* One Cloudflare v4 API call. Returns the parsed reply when it says
+ * success:true (caller frees), else logs and returns NULL. */
+static cJSON *cf_call(const char *method, const char *path, const cJSON *body) {
+	char url[1024], authz[600];
+	snprintf(url, sizeof url, "%s%s", cf_api, path);
+	snprintf(authz, sizeof authz, "Authorization: Bearer %s", cf_token);
+	struct curl_slist *h = curl_slist_append(NULL, authz);
+	h = curl_slist_append(h, "Content-Type: application/json");
+	char *js = body ? cJSON_PrintUnformatted(body) : NULL;
+	buf r = {0};
+	long code = http_req(method, url, h, js, js ? strlen(js) : 0, &r, NULL);
+	put(&r, "", 1);
+	cJSON *o = cJSON_Parse((char *)r.p);
+	if (code / 100 != 2 || !cJSON_IsTrue(cJSON_GetObjectItem(o, "success"))) {
+		cJSON *e = cJSON_GetArrayItem(cJSON_GetObjectItem(o, "errors"), 0);
+		fprintf(stderr, "cloudflare %s %s failed (HTTP %ld): %s\n", method, path, code,
+		        str(e, "message") ? str(e, "message") : "no details");
+		cJSON_Delete(o), o = NULL;
+	}
+	curl_slist_free_all(h), free(js), free(r.p);
+	return o;
+}
+
+/* Zone holding the hostname: PDS_CLOUDFLARE_ZONE_ID, else the first of
+ * hostname, its parent, ... (stopping above the TLD) that Cloudflare knows. */
+static int cf_zone_id(void) {
+	char path[400];
+	for (const char *d = hostname; !*cf_zone && d; d = strchr(d, '.') ? strchr(d, '.') + 1 : NULL) {
+		if (d != hostname && !strchr(d, '.')) break;
+		char *e = curl_easy_escape(NULL, d, 0);
+		snprintf(path, sizeof path, "/zones?name=%s", e);
+		curl_free(e);
+		cJSON *o = cf_call("GET", path, NULL);
+		const char *id = str(cJSON_GetArrayItem(cJSON_GetObjectItem(o, "result"), 0), "id");
+		if (id) snprintf(cf_zone, sizeof cf_zone, "%s", id);
+		cJSON_Delete(o);
+	}
+	if (!*cf_zone) fprintf(stderr, "cloudflare: no zone found for %s; set PDS_CLOUDFLARE_ZONE_ID\n", hostname);
+	return *cf_zone ? 0 : -1;
+}
+
+static cJSON *cf_txt(const char *name, const char *value) {
+	char quoted[300];
+	snprintf(quoted, sizeof quoted, "\"%s\"", value);
+	cJSON *b = cJSON_CreateObject();
+	cJSON_AddStringToObject(b, "type", "TXT");
+	cJSON_AddStringToObject(b, "name", name);
+	cJSON_AddStringToObject(b, "content", quoted);
+	cJSON_AddNumberToObject(b, "ttl", 1); /* automatic */
+	cJSON_AddStringToObject(b, "comment", "atproto handle, managed by the PDS");
+	return b;
+}
+
+/* Leaves exactly one did= TXT at name holding want, or none if want is NULL. */
+static int cf_sync(const char *name, const char *want) {
+	char path[800], v[300];
+	if (cf_zone_id()) return -1;
+	char *e = curl_easy_escape(NULL, name, 0);
+	snprintf(path, sizeof path, "/zones/%s/dns_records?type=TXT&name.exact=%s&per_page=100", cf_zone, e);
+	curl_free(e);
+	cJSON *list = cf_call("GET", path, NULL), *r, *o;
+	if (!list) return -1;
+	int have = 0, rc = 0;
+	cJSON_ArrayForEach(r, cJSON_GetObjectItem(list, "result")) {
+		const char *id = str(r, "id"), *n = str(r, "name"), *ct = str(r, "content");
+		if (!id || !n || !ct || strcasecmp(n, name) || strlen(id) > 64) continue;
+		txt_unquote(ct, v, sizeof v);
+		if (strncmp(v, "did=", 4)) continue; /* not ours */
+		if (want && !have && !strcmp(v, want)) {
+			have = 1;
+			continue;
+		}
+		snprintf(path, sizeof path, "/zones/%s/dns_records/%s", cf_zone, id);
+		cJSON *b = want && !have ? cf_txt(name, want) : NULL;
+		o = cf_call(b ? "PUT" : "DELETE", path, b);
+		rc |= o ? 0 : -1, have |= b && o;
+		cJSON_Delete(o), cJSON_Delete(b);
+	}
+	cJSON_Delete(list);
+	if (want && !have) {
+		cJSON *b = cf_txt(name, want);
+		snprintf(path, sizeof path, "/zones/%s/dns_records", cf_zone);
+		o = cf_call("POST", path, b);
+		rc |= o ? 0 : -1;
+		cJSON_Delete(o), cJSON_Delete(b);
+	}
+	return rc;
+}
+
+/* {"action":"upsert"|"delete","type":"TXT","name","content","handle","did"} */
+static int webhook_sync(const char *name, const char *handle, const char *did) {
+	char authz[600], content[300];
+	cJSON *b = cJSON_CreateObject();
+	cJSON_AddStringToObject(b, "action", did ? "upsert" : "delete");
+	cJSON_AddStringToObject(b, "type", "TXT");
+	cJSON_AddStringToObject(b, "name", name);
+	cJSON_AddStringToObject(b, "handle", handle);
+	if (did) {
+		snprintf(content, sizeof content, "did=%s", did);
+		cJSON_AddStringToObject(b, "content", content);
+		cJSON_AddStringToObject(b, "did", did);
+	}
+	char *js = cJSON_PrintUnformatted(b);
+	struct curl_slist *h = curl_slist_append(NULL, "Content-Type: application/json");
+	if (dns_webhook_token) {
+		snprintf(authz, sizeof authz, "Authorization: Bearer %s", dns_webhook_token);
+		h = curl_slist_append(h, authz);
+	}
+	long code = http(dns_webhook, h, js, strlen(js), NULL, NULL);
+	if (code / 100 != 2) fprintf(stderr, "dns webhook for %s failed (HTTP %ld)\n", name, code);
+	curl_slist_free_all(h), free(js), cJSON_Delete(b);
+	return code / 100 == 2 ? 0 : -1;
+}
+
+static void *dns_worker(void *arg) {
+	(void)arg;
+	for (;;) {
+		pthread_mutex_lock(&dns_mu);
+		while (!dns_head) pthread_cond_wait(&dns_cv, &dns_mu);
+		dns_job *j = dns_head;
+		if (!(dns_head = j->next)) dns_tail = &dns_head;
+		pthread_mutex_unlock(&dns_mu);
+
+		account a;
+		char name[300], want[80];
+		pthread_mutex_lock(&big);
+		int live = !find_account(j->handle, 0, &a) && !strcmp(a.handle, j->handle);
+		pthread_mutex_unlock(&big);
+		snprintf(name, sizeof name, "_atproto.%s", j->handle);
+		snprintf(want, sizeof want, "did=%s", live ? a.did : "");
+		int rc = !strcmp(dns_provider, "cloudflare") ? cf_sync(name, live ? want : NULL)
+		                                             : webhook_sync(name, j->handle, live ? a.did : NULL);
+		fprintf(stderr, "dns: %s %s%s\n", name, rc ? "FAILED " : "", live ? want : "(removed)");
+		free(j);
+	}
+	return NULL;
+}
+
+/* Reads PDS_DNS_* settings and starts the worker; -1 on bad config. */
+static int dns_init(void) {
+	const char *p = getenv("PDS_DNS_PROVIDER");
+	if (!p || !*p || !strcmp(p, "none")) return 0;
+	if (!strcmp(p, "cloudflare")) {
+		cf_token = getenv("PDS_CLOUDFLARE_API_TOKEN");
+		const char *z = getenv("PDS_CLOUDFLARE_ZONE_ID"), *api = getenv("PDS_CLOUDFLARE_API_URL");
+		cf_api = api && *api ? api : "https://api.cloudflare.com/client/v4";
+		if (z) snprintf(cf_zone, sizeof cf_zone, "%s", z);
+		if (!cf_token || !*cf_token) {
+			fprintf(stderr, "PDS_DNS_PROVIDER=cloudflare needs PDS_CLOUDFLARE_API_TOKEN\n");
+			return -1;
+		}
+	} else if (!strcmp(p, "webhook")) {
+		dns_webhook = getenv("PDS_DNS_WEBHOOK_URL");
+		dns_webhook_token = getenv("PDS_DNS_WEBHOOK_TOKEN");
+		if (dns_webhook_token && !*dns_webhook_token) dns_webhook_token = NULL;
+		if (!dns_webhook || !*dns_webhook) {
+			fprintf(stderr, "PDS_DNS_PROVIDER=webhook needs PDS_DNS_WEBHOOK_URL\n");
+			return -1;
+		}
+	} else {
+		fprintf(stderr, "PDS_DNS_PROVIDER must be cloudflare, webhook or none (got %s)\n", p);
+		return -1;
+	}
+	pthread_t t;
+	if (pthread_create(&t, NULL, dns_worker, NULL)) return -1;
+	pthread_detach(t);
+	dns_provider = p;
+	return 0;
+}
+
 /* ---------- XRPC handlers ---------- */
 
 /* 0 if the repo exists and is live; otherwise queues an error into *e. */
@@ -1287,6 +1517,7 @@ static res create_account(struct MHD_Connection *c, cJSON *b) {
 	free(pem), free(op), free(blocks.p);
 	broadcast();
 	if (rc) return err(c, 500, "InternalServerError", "could not create account");
+	dns_queue(a.handle);
 	request_crawl();
 	return session(c, &a);
 }
@@ -1304,6 +1535,24 @@ static int admin(struct MHD_Connection *c, res *e) {
 	if (n && h && strlen(h) == n && !CRYPTO_memcmp(h, admin_basic, n)) return 0;
 	++*fails;
 	return *e = err(c, 401, "AuthenticationRequired", "admin auth required"), -1;
+}
+
+static res admin_sync_dns(struct MHD_Connection *c, cJSON *b) {
+	(void)b;
+	res e;
+	if (admin(c, &e)) return e;
+	if (!dns_provider) return err(c, 400, "DnsNotConfigured", "set PDS_DNS_PROVIDER to publish handle TXT records");
+	sqlite3_stmt *s = q("SELECT handle FROM account", 0);
+	int n = 0;
+	while (sqlite3_step(s) == SQLITE_ROW) {
+		const char *h = (const char *)sqlite3_column_text(s, 0);
+		if (dns_managed(h)) dns_queue(h), n++;
+	}
+	sqlite3_finalize(s);
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "provider", dns_provider);
+	cJSON_AddNumberToObject(o, "queued", n);
+	return reply(c, 200, o);
 }
 
 static res admin_get_account_info(struct MHD_Connection *c, cJSON *b) {
@@ -1341,6 +1590,7 @@ static res admin_delete_account(struct MHD_Connection *c, cJSON *b) {
 	         account_event(a.did, "deleted");
 	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
 	broadcast();
+	if (!rc) dns_queue(a.handle);
 	return rc ? err(c, 500, "InternalServerError", "delete failed") : send_body(c, 200, "application/json", strdup("{}"));
 }
 
@@ -1737,7 +1987,8 @@ static int valid_domain(const char *h) {
 	for (size_t i = 0; i <= n; i++) {
 		if (h[i] == '.' || !h[i]) {
 			if (!label || label > 63 || h[i - 1] == '-' || h[i - label] == '-') return 0;
-			dots += h[i] == '.', label = 0, alpha_tld = 0;
+			if (h[i]) dots++, alpha_tld = 0; /* keep the last label's flag at the end */
+			label = 0;
 		} else if (islower((unsigned char)h[i]) || isdigit((unsigned char)h[i]) || h[i] == '-') {
 			label++, alpha_tld |= islower((unsigned char)h[i]);
 		} else {
@@ -1747,12 +1998,42 @@ static int valid_domain(const char *h) {
 	return dots && alpha_tld;
 }
 
-/* Custom-domain handles must serve our DID at https://<handle>/.well-known/atproto-did.
- * ponytail: the DNS TXT (_atproto.<handle>) method isn't checked; add it with
- * res_query if users want DNS-only handles. */
+/* DNS method: exactly one TXT _atproto.<handle> = "did=<did>". Looked up over
+ * DNS-over-HTTPS (JSON API at PDS_DOH_URL, default Cloudflare's 1.1.1.1), so
+ * no resolver library is needed. */
+static int dns_points_to(const char *handle, const char *did) {
+	char url[600], v[300];
+	const char *doh = env("PDS_DOH_URL", "https://cloudflare-dns.com/dns-query");
+	snprintf(url, sizeof url, "%s?name=_atproto.%s&type=TXT", doh, handle);
+	struct curl_slist *h = curl_slist_append(NULL, "Accept: application/dns-json");
+	buf r = {0};
+	long code = http(url, h, NULL, 0, &r, NULL);
+	curl_slist_free_all(h);
+	put(&r, "", 1);
+	cJSON *o = code == 200 ? cJSON_Parse((char *)r.p) : NULL, *a;
+	free(r.p);
+	int dids = 0, match = 0;
+	cJSON *st = cJSON_GetObjectItem(o, "Status");
+	if (cJSON_IsNumber(st) && st->valueint == 0) {
+		cJSON_ArrayForEach(a, cJSON_GetObjectItem(o, "Answer")) {
+			cJSON *t = cJSON_GetObjectItem(a, "type");
+			const char *d = str(a, "data");
+			if (!cJSON_IsNumber(t) || t->valueint != 16 || !d) continue;
+			txt_unquote(d, v, sizeof v);
+			if (strncmp(v, "did=", 4)) continue;
+			dids++, match |= !strcmp(v + 4, did);
+		}
+	}
+	cJSON_Delete(o);
+	return dids == 1 && match;
+}
+
+/* Custom-domain handles must point at our DID: a DNS TXT record (above) or
+ * https://<handle>/.well-known/atproto-did. */
 static int domain_points_to(const char *handle, const char *did) {
 	char url[300];
 	buf r = {0};
+	if (dns_points_to(handle, did)) return 1;
 	snprintf(url, sizeof url, "https://%s/.well-known/atproto-did", handle);
 	long code = http(url, NULL, NULL, 0, &r, NULL);
 	while (r.n && isspace(r.p[r.n - 1])) r.n--;
@@ -1795,6 +2076,7 @@ static res update_handle(struct MHD_Connection *c, cJSON *b) {
 	sqlite3_exec(db, rc ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
 	free(op);
 	broadcast();
+	if (!rc) dns_queue(a.handle), dns_queue(handle); /* drop the old record, publish the new */
 	return rc ? err(c, 500, "InternalServerError", "could not update handle")
 	          : send_body(c, 200, "application/json", strdup("{}"));
 }
@@ -2233,6 +2515,7 @@ static const struct {
     {"/xrpc/com.atproto.admin.updateAccountPassword", 1, admin_update_password},
     {"/xrpc/com.atproto.admin.getInviteCodes", 0, admin_get_invite_codes},
     {"/xrpc/com.atproto.admin.disableInviteCodes", 1, admin_disable_invite_codes},
+    {"/xrpc/com.pzx.admin.syncDns", 1, admin_sync_dns},
     {"/xrpc/com.atproto.server.createSession", 1, create_session},
     {"/xrpc/com.atproto.server.getSession", 0, get_session},
     {"/xrpc/com.atproto.server.refreshSession", 1, refresh_session},
@@ -2341,11 +2624,6 @@ static res handler(void *cls, struct MHD_Connection *c, const char *url, const c
 	return r;
 }
 
-static const char *env(const char *k, const char *def) {
-	const char *v = getenv(k);
-	return v && *v ? v : def;
-}
-
 /* Web admin panel: a static page (PDS_ADMIN_HTML, default ./admin.html) that
  * calls the admin XRPC routes itself; read per request so edits show live. */
 static res admin_page(struct MHD_Connection *c) {
@@ -2441,6 +2719,7 @@ int main(void) {
 		return 1;
 	}
 	curl_global_init(CURL_GLOBAL_DEFAULT);
+	if (dns_init()) return 1;
 	pthread_mutexattr_t ma;
 	pthread_mutexattr_init(&ma);
 	pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE);
@@ -2487,8 +2766,8 @@ int main(void) {
 		fprintf(stderr, "cannot listen on port %d\n", port);
 		return 1;
 	}
-	fprintf(stderr, "PDS %s listening on :%d (plc: %s, crawlers: %s)\n", hostname, port, plc_url ? plc_url : "off",
-	        crawlers ? crawlers : "off");
+	fprintf(stderr, "PDS %s listening on :%d (plc: %s, crawlers: %s, dns: %s)\n", hostname, port,
+	        plc_url ? plc_url : "off", crawlers ? crawlers : "off", dns_provider ? dns_provider : "off");
 	request_crawl();
 	for (;;) pause();
 }
