@@ -73,6 +73,12 @@ code { font: 12px ui-monospace, monospace; word-break: break-all; }
       <thead><tr><th>Handle</th><th>Email</th><th>DID</th><th>Created</th><th>Status</th><th></th></tr></thead>
       <tbody id="accounts"></tbody>
     </table></div>
+
+    <h2>DNS records</h2>
+    <form id="dns-form">
+      <span class="muted">Publishes <code>_atproto.&lt;handle&gt;</code> TXT <code>did=…</code> for every account (needs PDS_DNS_PROVIDER).</span>
+      <button>Re-sync DNS</button>
+    </form>
   </section>
 </main>
 <script>
@@ -230,6 +236,14 @@ $("account-form").onsubmit = e => {
     say("Account created", false, "Handle   : " + r.handle + "\nDID      : " + r.did + "\nPassword : " + password);
     $("account-form").reset();
     await Promise.all([loadInvites(), loadAccounts()]);
+  });
+};
+
+$("dns-form").onsubmit = e => {
+  e.preventDefault();
+  act(async () => {
+    const r = await call("com.pzx.admin.syncDns", { body: {} });
+    say(`Queued ${r.queued} handle(s) for DNS sync via ${r.provider}. Progress is in the PDS log.`);
   });
 };
 

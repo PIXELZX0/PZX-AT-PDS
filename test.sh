@@ -186,6 +186,101 @@ curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/tls-check?domain=
 curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/tls-check?domain=Alice.localhost" | grep -q 200 || fail tls-handle
 curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/tls-check?domain=evil.example" | grep -q 404 || fail tls-other
 
+# DNS: handle DIDs published as _atproto TXT records via a mock Cloudflare API,
+# which also answers DNS-over-HTTPS from the same records (third server)
+P3=$((PORT+2)); MP=$((PORT+3)); D3=$(mktemp -d)
+cat >"$D3/mock.py" <<'PY'
+import json, sys, itertools
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+recs, hooks, ids = {}, [], itertools.count(1)
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def send(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}")
+    def route(self, m):
+        u = urlparse(self.path); qs = {k: v[0] for k, v in parse_qs(u.query).items()}; p = u.path.split("/")
+        if u.path == "/_state": return self.send(200, {"records": list(recs.values()), "hooks": hooks})
+        if u.path == "/_reset": recs.clear(); hooks.clear(); return self.send(200, {})
+        if u.path == "/hook": hooks.append(self.body()); return self.send(200, {})
+        if u.path == "/dns-query":
+            ans = [{"name": r["name"], "type": 16, "data": r["content"]} for r in recs.values() if r["name"] == qs.get("name")]
+            return self.send(200, {"Status": 0, "Answer": ans})
+        if self.headers.get("Authorization") != "Bearer cftok":
+            return self.send(403, {"success": False, "errors": [{"message": "bad token"}]})
+        if u.path == "/client/v4/zones":
+            return self.send(200, {"success": True, "result": [{"id": "z1"}] if qs.get("name") == "localhost" else []})
+        if p[:5] != ["", "client", "v4", "zones", "z1"] or len(p) < 6 or p[5] != "dns_records":
+            return self.send(404, {"success": False, "errors": [{"message": "no route"}]})
+        if m == "GET":
+            return self.send(200, {"success": True, "result": [r for r in recs.values() if r["name"] == qs.get("name.exact") and r["type"] == qs.get("type")]})
+        if m == "POST":
+            r = dict(self.body(), id="r%d" % next(ids)); recs[r["id"]] = r
+            return self.send(200, {"success": True, "result": r})
+        rid = p[6] if len(p) > 6 else ""
+        if rid not in recs: return self.send(404, {"success": False, "errors": [{"message": "no record"}]})
+        if m == "PUT": recs[rid] = dict(self.body(), id=rid); return self.send(200, {"success": True, "result": recs[rid]})
+        if m == "DELETE": del recs[rid]; return self.send(200, {"success": True, "result": {"id": rid}})
+    def do_GET(self): self.route("GET")
+    def do_POST(self): self.route("POST")
+    def do_PUT(self): self.route("PUT")
+    def do_DELETE(self): self.route("DELETE")
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+python3 "$D3/mock.py" $MP & MPID=$!
+PDS_PORT=$P3 PDS_DB=$D3/t.sqlite PDS_JWT_SECRET=t PDS_INVITE_REQUIRED=false PDS_ADMIN_PASSWORD=adminpw \
+  PDS_DNS_PROVIDER=cloudflare PDS_CLOUDFLARE_API_TOKEN=cftok PDS_CLOUDFLARE_API_URL=http://127.0.0.1:$MP/client/v4 \
+  PDS_DOH_URL=http://127.0.0.1:$MP/dns-query ./pds 2>"$D3/log" &
+PID3=$!; trap 'kill $PID $PID2 $PID3 $MPID' EXIT
+for _ in $(seq 50); do curl -s localhost:$P3 >/dev/null && curl -s localhost:$MP/_state >/dev/null && break; sleep 0.1; done
+M=http://127.0.0.1:$MP
+post3() { (U=http://localhost:$P3/xrpc; post "$@"); }
+seed() { curl -s -X POST -H 'Authorization: Bearer cftok' -d "{\"type\":\"TXT\",\"name\":\"$1\",\"content\":\"\\\"$2\\\"\"}" $M/client/v4/zones/z1/dns_records >/dev/null; }
+# txt NAME: the record values at NAME, sorted and comma-joined
+txt() { curl -s $M/_state | python3 -c 'import json,sys; print(",".join(sorted(r["content"].strip("\"") for r in json.load(sys.stdin)["records"] if r["name"]==sys.argv[1])))' "$1"; }
+waitfor() { for _ in $(seq 50); do [ "$(txt "$1")" = "$2" ] && return 0; sleep 0.1; done; fail "dns $1: want '$2' got '$(txt "$1")'"; }
+seed _atproto.erin.localhost v=keep; seed _atproto.erin.localhost did=did:plc:stale
+R=$(post3 com.atproto.server.createAccount '{"handle":"erin.localhost","password":"p"}')
+ED=$(echo "$R" | field did); TOK=$(echo "$R" | field accessJwt)
+waitfor _atproto.erin.localhost "did=$ED,v=keep"
+TOK=$TOK post3 com.atproto.identity.updateHandle '{"handle":"erin2.localhost"}' | grep -q '^{}$' || fail dns-updateHandle
+waitfor _atproto.erin2.localhost "did=$ED"
+waitfor _atproto.erin.localhost "v=keep"
+# custom domain proven by a DNS TXT record alone (DoH), then left unmanaged
+TOK=$TOK post3 com.atproto.identity.updateHandle '{"handle":"erin.invalid"}' | grep -q InvalidHandle || fail dns-unproven
+seed _atproto.erin.invalid "did=$ED"
+TOK=$TOK post3 com.atproto.identity.updateHandle '{"handle":"erin.invalid"}' | grep -q '^{}$' || fail dns-txt-handle
+waitfor _atproto.erin2.localhost ""
+[ "$(txt _atproto.erin.invalid)" = "did=$ED" ] || fail dns-custom-untouched
+# admin re-sync rebuilds records; deleting the account removes them
+FD=$(post3 com.atproto.server.createAccount '{"handle":"fay.localhost","password":"p"}' | field did)
+waitfor _atproto.fay.localhost "did=$FD"
+curl -s -X POST $M/_reset >/dev/null
+post3 com.pzx.admin.syncDns '{}' | grep -q AuthenticationRequired || fail dns-sync-noadmin
+curl -s -X POST -u admin:adminpw -H 'Content-Type: application/json' -d '{}' "http://localhost:$P3/xrpc/com.pzx.admin.syncDns" | grep -q '"queued":1' || fail dns-sync
+waitfor _atproto.fay.localhost "did=$FD"
+curl -s -X POST $M/_reset >/dev/null
+PDS_ENV_FILE=/dev/null PDS_HOSTNAME=localhost PDS_PORT=$P3 PDS_ADMIN_PASSWORD=adminpw ./pdsadmin dns-sync | grep -q 'Queued 1' || fail cli-dns-sync
+waitfor _atproto.fay.localhost "did=$FD"
+curl -s -X POST -u admin:adminpw -H 'Content-Type: application/json' -d "{\"did\":\"$FD\"}" "http://localhost:$P3/xrpc/com.atproto.admin.deleteAccount" >/dev/null
+waitfor _atproto.fay.localhost ""
+curl -s -X POST -u admin:adminpw -H 'Content-Type: application/json' -d '{}' "$U/com.pzx.admin.syncDns" | grep -q DnsNotConfigured || fail dns-off
+# webhook provider: any DNS host can be bridged
+P4=$((PORT+4)); curl -s -X POST $M/_reset >/dev/null
+PDS_PORT=$P4 PDS_DB=$D3/w.sqlite PDS_JWT_SECRET=t PDS_INVITE_REQUIRED=false PDS_DNS_PROVIDER=webhook \
+  PDS_DNS_WEBHOOK_URL=$M/hook PDS_DNS_WEBHOOK_TOKEN=wh ./pds 2>"$D3/wlog" &
+PID4=$!; trap 'kill $PID $PID2 $PID3 $MPID $PID4' EXIT
+for _ in $(seq 50); do curl -s localhost:$P4 >/dev/null && break; sleep 0.1; done
+WD=$(U=http://localhost:$P4/xrpc post com.atproto.server.createAccount '{"handle":"gus.localhost","password":"p"}' | field did)
+for _ in $(seq 50); do curl -s $M/_state | grep -q "\"content\": \"did=$WD\"" && break; sleep 0.1; done
+curl -s $M/_state | grep -q '"action": "upsert", "type": "TXT", "name": "_atproto.gus.localhost"' || fail "webhook $(curl -s $M/_state)"
+PDS_PORT=$((PORT+5)) PDS_DB=$D3/x.sqlite PDS_DNS_PROVIDER=cloudflare ./pds 2>&1 | grep -q PDS_CLOUDFLARE_API_TOKEN || fail dns-config-check
+
 # login attempts per identifier are capped (10 per 5 min)
 for i in $(seq 10); do TOK= post com.atproto.server.createSession '{"identifier":"nobody.localhost","password":"x"}' >/dev/null; done
 TOK= post com.atproto.server.createSession '{"identifier":"nobody.localhost","password":"x"}' | grep -q RateLimitExceeded || fail ratelimit
